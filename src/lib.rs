@@ -1,14 +1,14 @@
-pub fn add(left: u64, right: u64) -> u64 {
-    left + right
-}
+// Copyright (c) Mysten Labs, Inc.
+// Modifications Copyright (c) 2025 IOTA Stiftung
+// SPDX-License-Identifier: Apache-2.0
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+/// Implementation of the BigTableDB client and its R&W operations.
+mod client;
+/// BigTableDB client errors.
+pub mod errors;
+/// DB operations metrics.
+pub mod metrics;
+/// Compiled protobuf definitions.
+pub mod proto;
 
-    #[test]
-    fn it_works() {
-        let result = add(2, 2);
-        assert_eq!(result, 4);
-    }
-}
+pub use client::{BigTableClient, Bytes, Cell, Row};
