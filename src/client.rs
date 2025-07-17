@@ -374,11 +374,12 @@ impl BigTableClient {
             filter,
             ..ReadRowsRequest::default()
         };
-        let mut result = vec![];
-        for row in self.read_rows(request).await? {
-            result.push(row.cells);
-        }
-        Ok(result)
+        Ok(self
+            .read_rows(request)
+            .await?
+            .into_iter()
+            .map(|row| row.cells)
+            .collect())
     }
 
     /// Performs a reverse scan over rows in Bigtable, starting from an upper
@@ -387,37 +388,41 @@ impl BigTableClient {
         &mut self,
         table_name: &str,
         upper_limit: Bytes,
+        rows_limit: usize,
     ) -> Result<Vec<Row>> {
         let start_time = Instant::now();
-        let result = self.reversed_scan_internal(table_name, upper_limit).await;
+        let result = self
+            .reversed_scan_internal(table_name, upper_limit, rows_limit)
+            .await;
         let elapsed_ms = start_time.elapsed().as_millis() as f64;
+
+        let Some(metrics) = &self.metrics else {
+            return result;
+        };
+
         let labels = [&self.client_name, table_name];
-        match &self.metrics {
-            Some(metrics) => match result {
-                Ok(result) => {
-                    metrics.scan_success.with_label_values(&labels).inc();
-                    if result.is_empty() {
-                        metrics.scan_not_found.with_label_values(&labels).inc();
-                    }
-                    metrics
-                        .scan_latency_ms
-                        .with_label_values(&labels)
-                        .observe(elapsed_ms);
-                    Ok(result)
-                }
-                Err(e) => {
-                    metrics.scan_error.with_label_values(&labels).inc();
-                    Err(e)
-                }
-            },
-            None => result,
+        let Ok(rows) = &result else {
+            metrics.scan_error.with_label_values(&labels).inc();
+            return result;
+        };
+
+        metrics.scan_success.with_label_values(&labels).inc();
+        if rows.is_empty() {
+            metrics.scan_not_found.with_label_values(&labels).inc();
         }
+        metrics
+            .scan_latency_ms
+            .with_label_values(&labels)
+            .observe(elapsed_ms);
+
+        result
     }
 
     async fn reversed_scan_internal(
         &mut self,
         table_name: &str,
         upper_limit: Bytes,
+        rows_limit: usize,
     ) -> Result<Vec<Row>> {
         let range = RowRange {
             start_key: None,
@@ -425,7 +430,7 @@ impl BigTableClient {
         };
         let request = ReadRowsRequest {
             table_name: self.table_name(table_name),
-            rows_limit: 1,
+            rows_limit: rows_limit as i64,
             rows: Some(RowSet {
                 row_keys: vec![],
                 row_ranges: vec![range],

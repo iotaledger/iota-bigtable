@@ -14,10 +14,10 @@ pub enum BigTableClientError {
     GrpcTransport(#[from] tonic::transport::Error),
     #[error("Environment variable error: `{0}`")]
     Env(#[from] std::env::VarError),
-    #[error("gRPC channel error: `{0}`")]
+    #[error("Invalid URI: `{0}`")]
     InvalidUri(#[from] http::uri::InvalidUri),
     #[error("GCP Auth error: `{0}`")]
-    Gcp(#[from] gcp_auth::Error),
+    GcpAuth(#[from] gcp_auth::Error),
     #[error("Bigtable write error: code `{status}`, message: `{message}`")]
     BigtableWriteError { status: i32, message: String },
     #[error("Header value error: `{0}`")]

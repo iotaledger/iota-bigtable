@@ -23,33 +23,35 @@ pub(crate) struct Metrics {
 }
 
 impl Metrics {
+    const LABLES: &[&'static str; 2] = &["client", "table"];
+
     pub(crate) fn new(registry: &Registry) -> Arc<Self> {
         Arc::new(Self {
             get_success: register_int_counter_vec_with_registry!(
                 "get_success",
-                "Number of successful fetches from kv store",
-                &["client", "table"],
+                "Number of successful fetches from BigTableDB",
+                Self::LABLES,
                 registry,
             )
             .unwrap(),
             get_not_found: register_int_counter_vec_with_registry!(
                 "get_not_found",
-                "Number of fetches from kv store that returned not found",
-                &["client", "table"],
+                "Number of fetches from BigTableDB that returned not found",
+                Self::LABLES,
                 registry,
             )
             .unwrap(),
             get_errors: register_int_counter_vec_with_registry!(
                 "get_errors",
-                "Number of fetches from kv store that returned an error",
-                &["client", "table"],
+                "Number of fetches from BigTableDB that returned an error",
+                Self::LABLES,
                 registry,
             )
             .unwrap(),
             get_latency_ms: register_histogram_vec_with_registry!(
                 "get_latency_ms",
-                "Latency of fetches from kv store",
-                &["client", "table"],
+                "Latency of fetches from BigTableDB",
+                Self::LABLES,
                 prometheus::exponential_buckets(1.0, 1.6, 24)
                     .unwrap()
                     .to_vec(),
@@ -58,8 +60,8 @@ impl Metrics {
             .unwrap(),
             get_batch_size: register_histogram_vec_with_registry!(
                 "get_batch_size",
-                "Number of keys fetched per batch from kv store",
-                &["client", "table"],
+                "Number of keys fetched per batch from BigTableDB",
+                Self::LABLES,
                 prometheus::exponential_buckets(1.0, 1.6, 20)
                     .unwrap()
                     .to_vec(),
@@ -68,8 +70,8 @@ impl Metrics {
             .unwrap(),
             get_latency_ms_per_key: register_histogram_vec_with_registry!(
                 "get_latency_ms_per_key",
-                "Latency of fetches from kv store per key",
-                &["client", "table"],
+                "Latency of fetches from BigTableDB per key",
+                Self::LABLES,
                 prometheus::exponential_buckets(1.0, 1.6, 24)
                     .unwrap()
                     .to_vec(),
@@ -78,29 +80,29 @@ impl Metrics {
             .unwrap(),
             scan_success: register_int_counter_vec_with_registry!(
                 "scan_success",
-                "Number of successful scans from kv store",
-                &["client", "table"],
+                "Number of successful scans from BigTableDB",
+                Self::LABLES,
                 registry,
             )
             .unwrap(),
             scan_not_found: register_int_counter_vec_with_registry!(
                 "scan_not_found",
-                "Number of fetches from kv store that returned not found",
-                &["client", "table"],
+                "Number of fetches from BigTableDB that returned not found",
+                Self::LABLES,
                 registry,
             )
             .unwrap(),
             scan_error: register_int_counter_vec_with_registry!(
                 "scan_error",
-                "Number of scans from kv store that returned an error",
-                &["client", "table"],
+                "Number of scans from BigTableDB that returned an error",
+                Self::LABLES,
                 registry,
             )
             .unwrap(),
             scan_latency_ms: register_histogram_vec_with_registry!(
                 "scan_latency_ms",
-                "Latency of scans from kv store",
-                &["client", "table"],
+                "Latency of scans from BigTableDB",
+                Self::LABLES,
                 prometheus::exponential_buckets(1.0, 1.6, 24)
                     .unwrap()
                     .to_vec(),
