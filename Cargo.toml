@@ -13,7 +13,7 @@ prost = "0.13"
 prost-types = "0.13"
 serde = { version = "1.0.144", features = ["derive"] }
 thiserror = "2.0.12"
-tonic = { version = "0.13", features = ["tls-webpki-roots"] }
+tonic = { version = "0.13", features = ["tls-native-roots"] }
 
 [build-dependencies]
 tonic-build = { version = "0.13", features = ["prost", "transport"] }

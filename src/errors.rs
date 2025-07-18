@@ -22,4 +22,6 @@ pub enum BigTableClientError {
     BigtableWriteError { status: i32, message: String },
     #[error("Header value error: `{0}`")]
     InvalidHeaderValue(#[from] http::header::InvalidHeaderValue),
+    #[error("IO error: `{0}`")]
+    Io(#[from] std::io::Error),
 }

@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::{
+    fs,
     future::Future,
     pin::Pin,
     sync::{Arc, RwLock},
@@ -38,8 +39,6 @@ use crate::{
 
 /// BigTable GRPC Server max request size in bytes.
 const GRPC_MAX_REQUEST_SIZE: usize = 250 * 1024 * 1024; // 250 MB
-/// PEM certificate from Google Trust Services.
-const PEM_CERT: &[u8] = include_bytes!("../certs/google.pem");
 const MAX_MUTATIONS_PER_MUTATE_ROWS_REQUEST: usize = 100_000;
 const BIGTABLE_POLICY: &str = "https://www.googleapis.com/auth/bigtable.data";
 const BIGTABLE_API: &str = "https://bigtable.googleapis.com";
@@ -117,6 +116,13 @@ impl BigTableClient {
 
     /// Creates a new BigTableClient instance for a remote instance. It checks
     /// for the `GOOGLE_APPLICATION_CREDENTIALS` environment variable.
+    ///
+    /// # TLS Configuration
+    /// The gRPC communication is secured using TLS with the following priority:
+    /// 1. **Custom CA Certificate**: Set `BIGTABLE_CA_CERT_PATH` environment
+    ///    variable to the path of a PEM-encoded CA certificate file.
+    /// 2. **System Certificate Store**: Uses the platform's native trusted
+    ///    certificate store (automatically handles certificate rotation).
     pub async fn new_remote(
         instance_id: impl AsRef<str>,
         is_read_only: bool,
@@ -130,10 +136,14 @@ impl BigTableClient {
             .unwrap_or(BIGTABLE_POLICY.into());
 
         let token_provider = gcp_auth::provider().await?;
+        let mut tls_config = ClientTlsConfig::new().domain_name(BIGTABLE_DOMAIN);
+        if let Ok(custom_cert_path) = std::env::var("BIGTABLE_CA_CERT_PATH") {
+            let cert_bytes = fs::read(custom_cert_path)?;
+            tls_config = tls_config.ca_certificate(Certificate::from_pem(cert_bytes))
+        } else {
+            tls_config = tls_config.with_native_roots()
+        };
 
-        let tls_config = ClientTlsConfig::new()
-            .ca_certificate(Certificate::from_pem(PEM_CERT))
-            .domain_name(BIGTABLE_DOMAIN);
         let mut endpoint = Channel::from_static(BIGTABLE_API)
             .http2_keep_alive_interval(Duration::from_secs(60))
             .keep_alive_while_idle(true)
