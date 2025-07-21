@@ -1,6 +1,19 @@
 [package]
 name = "iota-bigtable"
 version = "0.1.0"
+authors = ["IOTA Foundation <info@iota.org>"]
 edition = "2024"
+license = "Apache-2.0"
 
 [dependencies]
+gcp_auth = "0.12.3"
+http = "1"
+prometheus = "0.14"
+prost = "0.13"
+prost-types = "0.13"
+serde = { version = "1.0.144", features = ["derive"] }
+thiserror = "2.0.12"
+tonic = { version = "0.13", features = ["tls-native-roots"] }
+
+[build-dependencies]
+tonic-build = { version = "0.13", features = ["prost", "transport"] }
