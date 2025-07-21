@@ -84,10 +84,15 @@ impl Row {
 /// requests over gRPC.
 #[derive(Clone)]
 pub struct BigTableClient {
+    /// gRPC client for interacting with Google BigTable.
     client: BigtableInternalClient<AuthChannel>,
+    /// Client name for logging and metrics.
     client_name: String,
+    /// Column family name for interacting with Google BigTable.
     column_family: String,
+    /// Table prefix for interacting with Google BigTable.
     table_prefix: String,
+    /// Prometheus metrics for tracking client performance.
     metrics: Option<Arc<Metrics>>,
 }
 
