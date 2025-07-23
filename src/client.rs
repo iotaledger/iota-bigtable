@@ -119,8 +119,23 @@ impl BigTableClient {
         })
     }
 
-    /// Creates a new BigTableClient instance for a remote instance. It checks
-    /// for the `GOOGLE_APPLICATION_CREDENTIALS` environment variable.
+    /// Creates a new BigTableClient instance for a remote instance.
+    ///
+    /// # Authentication
+    /// Google Cloud Platform (GCP) authentication with
+    /// automatic credential discovery. The authentication process searches
+    /// for credentials in the following order of precedence:
+    ///
+    /// 1. Check if the `GOOGLE_APPLICATION_CREDENTIALS` environment variable if
+    ///    set; if so, use a custom service account as the token source.
+    /// 2. Look for credentials in
+    ///    `.config/gcloud/application_default_credentials.json`; if found, use
+    ///    these credentials to request refresh tokens.
+    /// 3. Send a HTTP request to the internal metadata server to retrieve a
+    ///    token; if it succeeds, use the default service account as the token
+    ///    source.
+    /// 4. Check if the `gcloud` tool is available on the `PATH`; if so, use the
+    ///    `gcloud auth print-access-token` command as the token source.
     ///
     /// # TLS Configuration
     /// The gRPC communication is secured using TLS with the following priority:
