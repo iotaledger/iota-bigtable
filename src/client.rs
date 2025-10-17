@@ -319,13 +319,13 @@ impl BigTableClient {
             let mut response = self.mutate_rows(request).await?;
             while let Some(part) = response.message().await? {
                 for entry in part.entries {
-                    if let Some(status) = entry.status {
-                        if status.code != 0 {
-                            return Err(BigTableClientError::BigtableWriteError {
-                                status: status.code,
-                                message: status.message,
-                            });
-                        }
+                    if let Some(status) = entry.status
+                        && status.code != 0
+                    {
+                        return Err(BigTableClientError::BigtableWriteError {
+                            status: status.code,
+                            message: status.message,
+                        });
                     }
                 }
             }
