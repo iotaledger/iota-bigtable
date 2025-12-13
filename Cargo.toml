@@ -6,7 +6,7 @@ edition = "2024"
 license = "Apache-2.0"
 
 [dependencies]
-gcp_auth = "0.12.3"
+gcp_auth = "0.12.5"
 http = "1"
 prometheus = "0.14"
 prost = "0.13"
