@@ -301,25 +301,24 @@ dependencies = [
 
 [[package]]
 name = "gcp_auth"
-version = "0.12.3"
+version = "0.12.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dbf67f30198e045a039264c01fb44659ce82402d7771c50938beb41a5ac87733"
+checksum = "d24fd9357c4d0ae97d90b38e8fabeb07f9590f6944f4f65f50b5110d7c3882b6"
 dependencies = [
  "async-trait",
  "base64",
  "bytes",
  "chrono",
- "home",
  "http",
  "http-body-util",
  "hyper",
  "hyper-rustls",
  "hyper-util",
  "ring",
- "rustls-pemfile",
+ "rustls-pki-types",
  "serde",
  "serde_json",
- "thiserror 1.0.69",
+ "thiserror 2.0.12",
  "tokio",
  "tracing",
  "tracing-futures",
@@ -385,15 +384,6 @@ name = "heck"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
-
-[[package]]
-name = "home"
-version = "0.5.11"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "589533453244b0995c858700322199b2becb13b627df2851f64a2775d024abcf"
-dependencies = [
- "windows-sys 0.59.0",
-]
 
 [[package]]
 name = "http"
@@ -1116,15 +1106,6 @@ dependencies = [
  "rustls-pki-types",
  "schannel",
  "security-framework",
-]
-
-[[package]]
-name = "rustls-pemfile"
-version = "2.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dce314e5fee3f39953d46bb63bb8a46d40c2f8fb7cc5a3b6cab2bde9721d6e50"
-dependencies = [
- "rustls-pki-types",
 ]
 
 [[package]]
