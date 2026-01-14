@@ -340,7 +340,7 @@ impl BigTableClient {
         table_name: &str,
         keys: Vec<Bytes>,
         filter: Option<RowFilter>,
-    ) -> Result<Vec<Vec<Cell>>> {
+    ) -> Result<Vec<Row>> {
         let start_time = Instant::now();
         let num_keys_requested = keys.len();
         let result = self.multi_get_internal(table_name, keys, filter).await;
@@ -393,7 +393,7 @@ impl BigTableClient {
         table_name: &str,
         keys: Vec<Bytes>,
         filter: Option<RowFilter>,
-    ) -> Result<Vec<Vec<Cell>>> {
+    ) -> Result<Vec<Row>> {
         let request = ReadRowsRequest {
             table_name: self.table_name(table_name),
             rows_limit: keys.len() as i64,
@@ -404,12 +404,7 @@ impl BigTableClient {
             filter,
             ..ReadRowsRequest::default()
         };
-        Ok(self
-            .read_rows(request)
-            .await?
-            .into_iter()
-            .map(|row| row.cells)
-            .collect())
+        self.read_rows(request).await
     }
 
     /// Performs a reverse scan over rows in Bigtable, starting from an upper
