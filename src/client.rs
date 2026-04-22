@@ -33,7 +33,7 @@ use crate::{
         mutate_rows_request::Entry,
         mutation::{self, SetCell},
         read_rows_response::cell_chunk::RowStatus,
-        row_range::EndKey,
+        row_range::{EndKey, StartKey},
     },
 };
 
@@ -407,17 +407,30 @@ impl BigTableClient {
         self.read_rows(request).await
     }
 
-    /// Performs a reverse scan over rows in Bigtable, starting from an upper
-    /// limit. Useful for retrieving data in descending order.
-    pub async fn reversed_scan(
+    /// Performs a range scan over rows in Bigtable.
+    ///
+    /// `start_key` and `end_key` define the key bounds of the scan, it can be
+    /// inclusive or exclusive. Passing `None` for `start_key` starts the
+    /// scan at the first row in the table; passing `None` for `end_key`
+    /// runs it through the last row. If both are `None`, the entire table
+    /// is scanned (subject to `rows_limit`). When `reversed` is `true`,
+    /// rows are returned in descending key order.
+    ///
+    /// `rows_limit` caps the number of rows returned, the server stops
+    /// streaming once that many rows have been produced. To return all results
+    /// without any cap use `0`.
+    pub async fn range_scan(
         &mut self,
         table_name: &str,
-        upper_limit: Bytes,
+        start_key: Option<StartKey>,
+        end_key: Option<EndKey>,
         rows_limit: usize,
+        reversed: bool,
+        filter: Option<RowFilter>,
     ) -> Result<Vec<Row>> {
         let start_time = Instant::now();
         let result = self
-            .reversed_scan_internal(table_name, upper_limit, rows_limit)
+            .range_scan_internal(table_name, start_key, end_key, rows_limit, reversed, filter)
             .await;
         let elapsed_ms = start_time.elapsed().as_millis() as f64;
 
@@ -443,24 +456,24 @@ impl BigTableClient {
         result
     }
 
-    async fn reversed_scan_internal(
+    async fn range_scan_internal(
         &mut self,
         table_name: &str,
-        upper_limit: Bytes,
+        start_key: Option<StartKey>,
+        end_key: Option<EndKey>,
         rows_limit: usize,
+        reversed: bool,
+        filter: Option<RowFilter>,
     ) -> Result<Vec<Row>> {
-        let range = RowRange {
-            start_key: None,
-            end_key: Some(EndKey::EndKeyClosed(upper_limit)),
-        };
         let request = ReadRowsRequest {
             table_name: self.table_name(table_name),
             rows_limit: rows_limit as i64,
             rows: Some(RowSet {
                 row_keys: vec![],
-                row_ranges: vec![range],
+                row_ranges: vec![RowRange { start_key, end_key }],
             }),
-            reversed: true,
+            reversed,
+            filter,
             ..ReadRowsRequest::default()
         };
         self.read_rows(request).await
