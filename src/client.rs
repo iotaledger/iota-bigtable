@@ -11,6 +11,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use backoff::ExponentialBackoff;
 use gcp_auth::{Token, TokenProvider};
 use http::{HeaderValue, Request, Response};
 use prometheus::Registry;
@@ -20,7 +21,7 @@ use tonic::{
     Streaming,
     body::Body,
     codegen::Service,
-    transport::{Certificate, Channel, ClientTlsConfig},
+    transport::{Certificate, Channel, ClientTlsConfig, Endpoint},
 };
 
 use crate::{
@@ -43,6 +44,9 @@ const MAX_MUTATIONS_PER_MUTATE_ROWS_REQUEST: usize = 100_000;
 const BIGTABLE_POLICY: &str = "https://www.googleapis.com/auth/bigtable.data";
 const BIGTABLE_API: &str = "https://bigtable.googleapis.com";
 const BIGTABLE_DOMAIN: &str = "bigtable.googleapis.com";
+
+/// Maximum allowed number of connections in the connection pool.
+const POOL_SIZE: usize = 10;
 
 pub type Bytes = Vec<u8>;
 
@@ -164,19 +168,25 @@ impl BigTableClient {
             tls_config = tls_config.with_native_roots()
         };
 
-        let mut endpoint = Channel::from_static(BIGTABLE_API)
+        // Create a shared endpoint with keep-alive and TLS configuration.
+        let mut endpoint = Endpoint::from_static(BIGTABLE_API)
             .http2_keep_alive_interval(Duration::from_secs(60))
             .keep_alive_while_idle(true)
             .tls_config(tls_config)?;
         if let Some(timeout) = timeout {
             endpoint = endpoint.timeout(timeout);
         }
+
+        // Create a channel pool with the shared endpoint.
+        let endpoints = std::iter::repeat_n(endpoint, POOL_SIZE);
+        let channel_pool = Channel::balance_list(endpoints);
+
         let table_prefix = format!(
             "projects/{}/instances/{}/tables/",
             token_provider.project_id().await?,
             instance_id.as_ref()
         );
-        let auth_channel = AuthChannel::new_remote(endpoint.connect_lazy(), policy, token_provider);
+        let auth_channel = AuthChannel::new_remote(channel_pool, policy, token_provider);
         Ok(Self {
             table_prefix,
             client: BigtableInternalClient::new(auth_channel),
@@ -190,6 +200,22 @@ impl BigTableClient {
         format!("{}{table_name}", self.table_prefix)
     }
 
+    /// Retries the provided closure using an [`ExponentialBackoff`]
+    async fn with_retry<F, Fut, T, E>(f: F) -> std::result::Result<T, E>
+    where
+        F: Fn() -> Fut,
+        Fut: Future<Output = std::result::Result<T, backoff::Error<E>>>,
+    {
+        let backoff = ExponentialBackoff {
+            max_elapsed_time: Some(Duration::from_secs(2)),
+            initial_interval: Duration::from_millis(100),
+            multiplier: 1.2,
+            ..Default::default()
+        };
+
+        backoff::future::retry(backoff, f).await
+    }
+
     /// Mutates multiple rows in a batch. Each individual row is mutated
     /// atomically as in MutateRow, but the entire batch is not executed
     /// atomically.
@@ -200,8 +226,7 @@ impl BigTableClient {
         Ok(self.client.mutate_rows(request).await?.into_inner())
     }
 
-    /// Reads rows from Bigtable and returns their keys and cell values.
-    pub async fn read_rows(&mut self, request: ReadRowsRequest) -> Result<Vec<Row>> {
+    async fn read_rows_internal(&mut self, request: ReadRowsRequest) -> Result<Vec<Row>> {
         let mut rows = vec![];
         let mut response = self.client.read_rows(request).await?.into_inner();
 
@@ -255,6 +280,21 @@ impl BigTableClient {
             }
         }
         Ok(rows)
+    }
+
+    /// Reads rows from Bigtable and returns their keys and cell values.
+    ///
+    /// Applies backoff retries to handle transient errors.
+    pub async fn read_rows(&mut self, request: ReadRowsRequest) -> Result<Vec<Row>> {
+        Self::with_retry(|| async {
+            let request = request.clone();
+            let mut client = self.clone();
+            client
+                .read_rows_internal(request)
+                .await
+                .map_err(BigTableClientError::into_backoff_error)
+        })
+        .await
     }
 
     /// Sets multiple rows in Bigtable in a single batch operation.

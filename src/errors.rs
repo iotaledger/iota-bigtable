@@ -25,3 +25,34 @@ pub enum BigTableClientError {
     #[error("io error: `{0}`")]
     Io(#[from] std::io::Error),
 }
+
+impl BigTableClientError {
+    /// Converts this error into a [`backoff::Error`].
+    pub(crate) fn into_backoff_error(self) -> backoff::Error<Self> {
+        use tonic::Code::*;
+
+        if let BigTableClientError::Grpc(status) = &self
+            && matches!(
+                status.code(),
+                Cancelled
+                    | Aborted
+                    | Internal
+                    | Unknown
+                    | Unavailable
+                    | DeadlineExceeded
+                    | ResourceExhausted
+            )
+        {
+            return backoff::Error::transient(self);
+        }
+
+        // we don't have access to the error kind, so we use the error message instead.
+        if let BigTableClientError::GrpcTransport(e) = &self
+            && e.to_string().contains("transport error")
+        {
+            return backoff::Error::transient(self);
+        }
+
+        backoff::Error::permanent(self)
+    }
+}
