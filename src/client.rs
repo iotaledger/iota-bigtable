@@ -11,7 +11,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use backoff::ExponentialBackoff;
+use backoff::{ExponentialBackoff, backoff::Backoff};
 use gcp_auth::{Token, TokenProvider};
 use http::{HeaderValue, Request, Response};
 use prometheus::Registry;
@@ -47,6 +47,9 @@ const BIGTABLE_DOMAIN: &str = "bigtable.googleapis.com";
 
 /// Maximum allowed number of connections in the connection pool.
 const POOL_SIZE: usize = 10;
+
+/// The maximum allowed elapsed time in seconds for transient errors.
+const TRANSIENT_ERRORS_MAX_ELAPSED_TIME_SECS: Duration = Duration::from_secs(10);
 
 pub type Bytes = Vec<u8>;
 
@@ -98,6 +101,7 @@ pub struct BigTableClient {
     table_prefix: String,
     /// Prometheus metrics for tracking client performance.
     metrics: Option<Arc<Metrics>>,
+    backoff: ExponentialBackoff,
 }
 
 impl BigTableClient {
@@ -111,6 +115,7 @@ impl BigTableClient {
         let emulator_host = std::env::var("BIGTABLE_EMULATOR_HOST")?;
         let channel = Channel::from_shared(format!("http://{emulator_host}"))?.connect_lazy();
         let auth_channel = AuthChannel::new_localhost(channel, BIGTABLE_POLICY);
+
         Ok(Self {
             table_prefix: format!(
                 "projects/emulator/instances/{}/tables/",
@@ -120,6 +125,7 @@ impl BigTableClient {
             client_name: "local".to_string(),
             column_family: column_family.into(),
             metrics: None,
+            backoff: Self::default_backoff(),
         })
     }
 
@@ -193,27 +199,43 @@ impl BigTableClient {
             client_name: client_name.into(),
             column_family: column_family.into(),
             metrics: registry.map(Metrics::new),
+            backoff: Self::default_backoff(),
         })
+    }
+
+    /// Registers a custom backoff configuration template for the client
+    /// overwriting the default one.
+    ///
+    /// The backoff is used to control the retry behavior of the client for
+    /// transient errors.
+    pub fn with_backoff(mut self, backoff: ExponentialBackoff) -> Self {
+        self.backoff = backoff;
+        self
+    }
+
+    /// Returns the default backoff configuration template for the client.
+    fn default_backoff() -> ExponentialBackoff {
+        ExponentialBackoff {
+            max_elapsed_time: Some(TRANSIENT_ERRORS_MAX_ELAPSED_TIME_SECS),
+            initial_interval: Duration::from_millis(100),
+            multiplier: 1.2,
+            ..Default::default()
+        }
+    }
+
+    /// Creates a new [`ExponentialBackoff`] instance based on the configured
+    /// template.
+    ///
+    /// Returns a fresh backoff instance that has been reset to its initial
+    /// state, ensuring consistent retry behavior for each new operation.
+    pub(crate) fn backoff(&self) -> ExponentialBackoff {
+        let mut backoff = self.backoff.clone();
+        backoff.reset();
+        backoff
     }
 
     fn table_name(&self, table_name: &str) -> String {
         format!("{}{table_name}", self.table_prefix)
-    }
-
-    /// Retries the provided closure using an [`ExponentialBackoff`]
-    async fn with_retry<F, Fut, T, E>(f: F) -> std::result::Result<T, E>
-    where
-        F: Fn() -> Fut,
-        Fut: Future<Output = std::result::Result<T, backoff::Error<E>>>,
-    {
-        let backoff = ExponentialBackoff {
-            max_elapsed_time: Some(Duration::from_secs(2)),
-            initial_interval: Duration::from_millis(100),
-            multiplier: 1.2,
-            ..Default::default()
-        };
-
-        backoff::future::retry(backoff, f).await
     }
 
     /// Mutates multiple rows in a batch. Each individual row is mutated
@@ -286,7 +308,7 @@ impl BigTableClient {
     ///
     /// Applies backoff retries to handle transient errors.
     pub async fn read_rows(&mut self, request: ReadRowsRequest) -> Result<Vec<Row>> {
-        Self::with_retry(|| async {
+        backoff::future::retry(self.backoff(), || async {
             let request = request.clone();
             let mut client = self.clone();
             client
