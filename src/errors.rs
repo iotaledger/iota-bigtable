@@ -27,12 +27,13 @@ pub enum BigTableClientError {
 }
 
 impl BigTableClientError {
-    /// Converts this error into a [`backoff::Error`].
-    pub(crate) fn into_backoff_error(self) -> backoff::Error<Self> {
+    /// Returns `true` if the error is permanent one and is not subject to
+    /// transient retries, `false` otherwise.
+    pub(crate) fn is_permantent(&self) -> bool {
         use tonic::Code::*;
 
-        if let BigTableClientError::Grpc(status) = &self
-            && matches!(
+        if let BigTableClientError::Grpc(status) = &self {
+            return !matches!(
                 status.code(),
                 Cancelled
                     | Aborted
@@ -41,18 +42,14 @@ impl BigTableClientError {
                     | Unavailable
                     | DeadlineExceeded
                     | ResourceExhausted
-            )
-        {
-            return backoff::Error::transient(self);
+            );
         }
 
         // we don't have access to the error kind, so we use the error message instead.
-        if let BigTableClientError::GrpcTransport(e) = &self
-            && e.to_string().contains("transport error")
-        {
-            return backoff::Error::transient(self);
+        if let BigTableClientError::GrpcTransport(e) = &self {
+            return !e.to_string().contains("transport error");
         }
 
-        backoff::Error::permanent(self)
+        true
     }
 }
