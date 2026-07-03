@@ -117,6 +117,12 @@ impl Backoff for BackoffPolicy {
 
 /// A high-level client for interacting with Google BigTable using authenticated
 /// requests over gRPC.
+///
+/// # Backoff on Transient Errors
+/// By default the client does **not** retry transient errors. Call
+/// [`with_backoff`](Self::with_backoff) to enable retries. Optionally, use
+/// [`default_backoff`](Self::default_backoff) to get a pre-configured backoff
+/// policy.
 #[derive(Clone)]
 pub struct BigTableClient {
     /// gRPC client for interacting with Google BigTable.
@@ -129,6 +135,7 @@ pub struct BigTableClient {
     table_prefix: String,
     /// Prometheus metrics for tracking client performance.
     metrics: Option<Arc<Metrics>>,
+    /// The backoff policy to use for transient errors.
     backoff: BackoffPolicy,
 }
 
@@ -231,16 +238,15 @@ impl BigTableClient {
         })
     }
 
-    /// Registers a custom backoff configuration template for the client.
+    /// Enables retrying of transient errors using the given backoff policy.
     ///
-    /// The backoff is used to control the retry behavior of the client for
-    /// transient errors.
+    /// By default the client performs no retries; call this to opt in.
     pub fn with_backoff(mut self, backoff: ExponentialBackoff) -> Self {
         self.backoff = BackoffPolicy::Exponential(backoff);
         self
     }
 
-    /// Returns the default backoff configuration template for the client.
+    /// Returns the default backoff configuration for the client.
     pub fn default_backoff() -> ExponentialBackoff {
         ExponentialBackoff {
             max_elapsed_time: Some(TRANSIENT_ERRORS_MAX_ELAPSED_TIME_SECS),
