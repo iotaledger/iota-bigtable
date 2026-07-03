@@ -11,7 +11,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-use backoff::{ExponentialBackoff, backoff::Backoff};
+use backoff::{
+    ExponentialBackoff,
+    backoff::{Backoff, Stop},
+};
 use gcp_auth::{Token, TokenProvider};
 use http::{HeaderValue, Request, Response};
 use prometheus::Registry;
@@ -87,6 +90,31 @@ impl Row {
     }
 }
 
+/// Retry policy for the client.
+#[derive(Debug, Clone)]
+enum BackoffPolicy {
+    /// Never retry.
+    Stop,
+    /// Retry transient errors with exponential backoff.
+    Exponential(ExponentialBackoff),
+}
+
+impl Backoff for BackoffPolicy {
+    fn next_backoff(&mut self) -> Option<Duration> {
+        match self {
+            BackoffPolicy::Stop => Stop {}.next_backoff(),
+            BackoffPolicy::Exponential(b) => b.next_backoff(),
+        }
+    }
+
+    fn reset(&mut self) {
+        match self {
+            BackoffPolicy::Stop => Stop {}.reset(),
+            BackoffPolicy::Exponential(b) => b.reset(),
+        }
+    }
+}
+
 /// A high-level client for interacting with Google BigTable using authenticated
 /// requests over gRPC.
 #[derive(Clone)]
@@ -101,7 +129,7 @@ pub struct BigTableClient {
     table_prefix: String,
     /// Prometheus metrics for tracking client performance.
     metrics: Option<Arc<Metrics>>,
-    backoff: ExponentialBackoff,
+    backoff: BackoffPolicy,
 }
 
 impl BigTableClient {
@@ -125,7 +153,7 @@ impl BigTableClient {
             client_name: "local".to_string(),
             column_family: column_family.into(),
             metrics: None,
-            backoff: Self::default_backoff(),
+            backoff: BackoffPolicy::Stop,
         })
     }
 
@@ -199,22 +227,21 @@ impl BigTableClient {
             client_name: client_name.into(),
             column_family: column_family.into(),
             metrics: registry.map(Metrics::new),
-            backoff: Self::default_backoff(),
+            backoff: BackoffPolicy::Stop,
         })
     }
 
-    /// Registers a custom backoff configuration template for the client
-    /// overwriting the default one.
+    /// Registers a custom backoff configuration template for the client.
     ///
     /// The backoff is used to control the retry behavior of the client for
     /// transient errors.
     pub fn with_backoff(mut self, backoff: ExponentialBackoff) -> Self {
-        self.backoff = backoff;
+        self.backoff = BackoffPolicy::Exponential(backoff);
         self
     }
 
     /// Returns the default backoff configuration template for the client.
-    fn default_backoff() -> ExponentialBackoff {
+    pub fn default_backoff() -> ExponentialBackoff {
         ExponentialBackoff {
             max_elapsed_time: Some(TRANSIENT_ERRORS_MAX_ELAPSED_TIME_SECS),
             initial_interval: Duration::from_millis(100),
@@ -223,12 +250,12 @@ impl BigTableClient {
         }
     }
 
-    /// Creates a new [`ExponentialBackoff`] instance based on the configured
+    /// Creates a new [`BackoffPolicy`] instance based on the configured
     /// template.
     ///
     /// Returns a fresh backoff instance that has been reset to its initial
     /// state, ensuring consistent retry behavior for each new operation.
-    pub(crate) fn backoff(&self) -> ExponentialBackoff {
+    fn backoff(&self) -> BackoffPolicy {
         let mut backoff = self.backoff.clone();
         backoff.reset();
         backoff
