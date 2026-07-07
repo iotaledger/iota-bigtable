@@ -11,6 +11,10 @@ use std::{
     time::{Duration, Instant},
 };
 
+use backoff::{
+    ExponentialBackoff,
+    backoff::{Backoff, Stop},
+};
 use gcp_auth::{Token, TokenProvider};
 use http::{HeaderValue, Request, Response};
 use prometheus::Registry;
@@ -20,7 +24,7 @@ use tonic::{
     Streaming,
     body::Body,
     codegen::Service,
-    transport::{Certificate, Channel, ClientTlsConfig},
+    transport::{Certificate, Channel, ClientTlsConfig, Endpoint},
 };
 
 use crate::{
@@ -43,6 +47,12 @@ const MAX_MUTATIONS_PER_MUTATE_ROWS_REQUEST: usize = 100_000;
 const BIGTABLE_POLICY: &str = "https://www.googleapis.com/auth/bigtable.data";
 const BIGTABLE_API: &str = "https://bigtable.googleapis.com";
 const BIGTABLE_DOMAIN: &str = "bigtable.googleapis.com";
+
+/// Maximum allowed number of connections in the connection pool.
+const POOL_SIZE: usize = 10;
+
+/// The maximum allowed elapsed time in seconds for transient errors.
+const TRANSIENT_ERRORS_MAX_ELAPSED_TIME_SECS: Duration = Duration::from_secs(10);
 
 pub type Bytes = Vec<u8>;
 
@@ -80,8 +90,39 @@ impl Row {
     }
 }
 
+/// Retry policy for the client.
+#[derive(Debug, Clone)]
+enum BackoffPolicy {
+    /// Never retry.
+    Stop,
+    /// Retry transient errors with exponential backoff.
+    Exponential(ExponentialBackoff),
+}
+
+impl Backoff for BackoffPolicy {
+    fn next_backoff(&mut self) -> Option<Duration> {
+        match self {
+            BackoffPolicy::Stop => Stop {}.next_backoff(),
+            BackoffPolicy::Exponential(b) => b.next_backoff(),
+        }
+    }
+
+    fn reset(&mut self) {
+        match self {
+            BackoffPolicy::Stop => Stop {}.reset(),
+            BackoffPolicy::Exponential(b) => b.reset(),
+        }
+    }
+}
+
 /// A high-level client for interacting with Google BigTable using authenticated
 /// requests over gRPC.
+///
+/// # Backoff on Transient Errors
+/// By default the client does **not** retry transient errors. Call
+/// [`with_backoff`](Self::with_backoff) to enable retries. Optionally, use
+/// [`default_backoff`](Self::default_backoff) to get a pre-configured backoff
+/// policy.
 #[derive(Clone)]
 pub struct BigTableClient {
     /// gRPC client for interacting with Google BigTable.
@@ -94,6 +135,8 @@ pub struct BigTableClient {
     table_prefix: String,
     /// Prometheus metrics for tracking client performance.
     metrics: Option<Arc<Metrics>>,
+    /// The backoff policy to use for transient errors.
+    backoff: BackoffPolicy,
 }
 
 impl BigTableClient {
@@ -107,6 +150,7 @@ impl BigTableClient {
         let emulator_host = std::env::var("BIGTABLE_EMULATOR_HOST")?;
         let channel = Channel::from_shared(format!("http://{emulator_host}"))?.connect_lazy();
         let auth_channel = AuthChannel::new_localhost(channel, BIGTABLE_POLICY);
+
         Ok(Self {
             table_prefix: format!(
                 "projects/emulator/instances/{}/tables/",
@@ -116,6 +160,7 @@ impl BigTableClient {
             client_name: "local".to_string(),
             column_family: column_family.into(),
             metrics: None,
+            backoff: BackoffPolicy::Stop,
         })
     }
 
@@ -164,26 +209,62 @@ impl BigTableClient {
             tls_config = tls_config.with_native_roots()
         };
 
-        let mut endpoint = Channel::from_static(BIGTABLE_API)
+        // Create a shared endpoint with keep-alive and TLS configuration.
+        let mut endpoint = Endpoint::from_static(BIGTABLE_API)
             .http2_keep_alive_interval(Duration::from_secs(60))
             .keep_alive_while_idle(true)
             .tls_config(tls_config)?;
         if let Some(timeout) = timeout {
             endpoint = endpoint.timeout(timeout);
         }
+
+        // Create a channel pool with the shared endpoint.
+        let endpoints = std::iter::repeat_n(endpoint, POOL_SIZE);
+        let channel_pool = Channel::balance_list(endpoints);
+
         let table_prefix = format!(
             "projects/{}/instances/{}/tables/",
             token_provider.project_id().await?,
             instance_id.as_ref()
         );
-        let auth_channel = AuthChannel::new_remote(endpoint.connect_lazy(), policy, token_provider);
+        let auth_channel = AuthChannel::new_remote(channel_pool, policy, token_provider);
         Ok(Self {
             table_prefix,
             client: BigtableInternalClient::new(auth_channel),
             client_name: client_name.into(),
             column_family: column_family.into(),
             metrics: registry.map(Metrics::new),
+            backoff: BackoffPolicy::Stop,
         })
+    }
+
+    /// Enables retrying of transient errors using the given backoff policy.
+    ///
+    /// By default the client performs no retries; call this to opt in.
+    pub fn with_backoff(mut self, backoff: ExponentialBackoff) -> Self {
+        self.backoff = BackoffPolicy::Exponential(backoff);
+        self
+    }
+
+    /// Returns the default backoff configuration for the client.
+    pub fn default_backoff() -> ExponentialBackoff {
+        ExponentialBackoff {
+            max_elapsed_time: Some(TRANSIENT_ERRORS_MAX_ELAPSED_TIME_SECS),
+            initial_interval: Duration::from_millis(100),
+            multiplier: 1.2,
+            ..Default::default()
+        }
+    }
+
+    /// Creates a new [`BackoffPolicy`] instance based on the configured
+    /// template.
+    ///
+    /// Returns a fresh backoff instance that has been reset to its initial
+    /// state, ensuring consistent retry behavior for each new operation.
+    fn backoff(&self) -> BackoffPolicy {
+        let mut backoff = self.backoff.clone();
+        backoff.reset();
+        backoff
     }
 
     fn table_name(&self, table_name: &str) -> String {
@@ -200,8 +281,7 @@ impl BigTableClient {
         Ok(self.client.mutate_rows(request).await?.into_inner())
     }
 
-    /// Reads rows from Bigtable and returns their keys and cell values.
-    pub async fn read_rows(&mut self, request: ReadRowsRequest) -> Result<Vec<Row>> {
+    async fn read_rows_internal(&mut self, request: ReadRowsRequest) -> Result<Vec<Row>> {
         let mut rows = vec![];
         let mut response = self.client.read_rows(request).await?.into_inner();
 
@@ -255,6 +335,24 @@ impl BigTableClient {
             }
         }
         Ok(rows)
+    }
+
+    /// Reads rows from Bigtable and returns their keys and cell values.
+    ///
+    /// Applies backoff retries to handle transient errors.
+    pub async fn read_rows(&mut self, request: ReadRowsRequest) -> Result<Vec<Row>> {
+        backoff::future::retry(self.backoff(), || async {
+            let request = request.clone();
+            let mut client = self.clone();
+            client
+                .read_rows_internal(request)
+                .await
+                .map_err(|e| match e.is_permantent() {
+                    true => backoff::Error::permanent(e),
+                    false => e.into(),
+                })
+        })
+        .await
     }
 
     /// Sets multiple rows in Bigtable in a single batch operation.

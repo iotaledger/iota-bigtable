@@ -6,6 +6,7 @@ edition = "2024"
 license = "Apache-2.0"
 
 [dependencies]
+backoff = { version = "0.4.0", features = ["futures", "tokio"] }
 gcp_auth = "0.12.5"
 http = "1"
 prometheus = "0.14"

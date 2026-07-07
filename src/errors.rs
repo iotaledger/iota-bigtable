@@ -25,3 +25,31 @@ pub enum BigTableClientError {
     #[error("io error: `{0}`")]
     Io(#[from] std::io::Error),
 }
+
+impl BigTableClientError {
+    /// Returns `true` if the error is permanent one and is not subject to
+    /// transient retries, `false` otherwise.
+    pub(crate) fn is_permantent(&self) -> bool {
+        use tonic::Code::*;
+
+        if let BigTableClientError::Grpc(status) = &self {
+            return !matches!(
+                status.code(),
+                Cancelled
+                    | Aborted
+                    | Internal
+                    | Unknown
+                    | Unavailable
+                    | DeadlineExceeded
+                    | ResourceExhausted
+            );
+        }
+
+        // we don't have access to the error kind, so we use the error message instead.
+        if let BigTableClientError::GrpcTransport(e) = &self {
+            return !e.to_string().contains("transport error");
+        }
+
+        true
+    }
+}
