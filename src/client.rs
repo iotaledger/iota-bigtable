@@ -141,27 +141,11 @@ pub struct BigTableClient {
 
 impl BigTableClient {
     /// Creates a new BigTableClient instance for a local instance using the
-    /// emulator feature. It reads the emulator host from the
-    /// `BIGTABLE_EMULATOR_HOST` environment variable.
-    pub fn new_local(
-        instance_id: impl AsRef<str>,
-        column_family: impl Into<String>,
-    ) -> Result<Self> {
-        let emulator_host = std::env::var("BIGTABLE_EMULATOR_HOST")?;
-        Self::new_local_with_host(emulator_host, "local", instance_id, column_family)
-    }
-
-    /// Creates a new BigTableClient instance for a local instance using the
     /// emulator feature.
-    ///
-    /// Unlike [`new_local`](Self::new_local), the emulator host is passed
-    /// explicitly instead of being read from the `BIGTABLE_EMULATOR_HOST`
-    /// environment variable, and the client name (used for logging and metrics)
-    /// can be customized.
     ///
     /// `host` is expected in `host:port` form without a scheme (e.g.
     /// `127.0.0.1:8086`), the client then connects over plain HTTP.
-    pub fn new_local_with_host(
+    pub fn new_local(
         host: impl AsRef<str>,
         client_name: impl Into<String>,
         instance_id: impl AsRef<str>,
