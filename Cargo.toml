@@ -16,6 +16,7 @@ tonic-prost = "0.14"
 serde = { version = "1.0.144", features = ["derive"] }
 thiserror = "2.0.12"
 tonic = { version = "0.14", features = ["tls-native-roots"] }
+tracing = "0.1.44"
 
 [build-dependencies]
 tonic-prost-build = { version = "0.14" }

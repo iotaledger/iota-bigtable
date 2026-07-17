@@ -26,6 +26,7 @@ use tonic::{
     codegen::Service,
     transport::{Certificate, Channel, ClientTlsConfig, Endpoint},
 };
+use tracing::{debug, warn};
 
 use crate::{
     errors::{BigTableClientError, Result},
@@ -344,18 +345,44 @@ impl BigTableClient {
     ///
     /// Applies backoff retries to handle transient errors.
     pub async fn read_rows(&mut self, request: ReadRowsRequest) -> Result<Vec<Row>> {
-        backoff::future::retry(self.backoff(), || async {
-            let request = request.clone();
-            let mut client = self.clone();
-            client
-                .read_rows_internal(request)
-                .await
-                .map_err(|e| match e.is_permantent() {
-                    true => backoff::Error::permanent(e),
-                    false => e.into(),
-                })
-        })
-        .await
+        let table = request.table_name.as_str();
+        let num_keys = request.rows.as_ref().map_or(0, |set| set.row_keys.len());
+        let num_ranges = request.rows.as_ref().map_or(0, |set| set.row_ranges.len());
+
+        let start = Instant::now();
+        let rows = backoff::future::retry_notify(
+            self.backoff(),
+            || async {
+                let request = request.clone();
+                let mut client = self.clone();
+                client
+                    .read_rows_internal(request)
+                    .await
+                    .map_err(|e| match e.is_permantent() {
+                        true => backoff::Error::permanent(e),
+                        false => e.into(),
+                    })
+            },
+            |error, retry_delay: Duration| {
+                warn!(
+                    %table,
+                    %error,
+                    retry_in_ms = retry_delay.as_millis() as u64,
+                    "transient error while reading rows, retrying"
+                );
+            },
+        )
+        .await?;
+
+        debug!(
+            %table,
+            num_keys,
+            num_ranges,
+            rows_returned = rows.len(),
+            elapsed_ms = start.elapsed().as_millis() as u64,
+            "read rows from BigTable"
+        );
+        Ok(rows)
     }
 
     /// Sets multiple rows in Bigtable in a single batch operation.
@@ -410,6 +437,8 @@ impl BigTableClient {
             })
             .collect::<Vec<Entry>>();
 
+        let num_entries = entries.len();
+        let start = Instant::now();
         for entries in Self::batch_entries_by_size(entries) {
             let request = MutateRowsRequest {
                 table_name: self.table_name(table_name),
@@ -431,6 +460,13 @@ impl BigTableClient {
                 }
             }
         }
+
+        debug!(
+            table = table_name,
+            num_entries,
+            elapsed_ms = start.elapsed().as_millis() as u64,
+            "wrote rows to BigTable"
+        );
         Ok(())
     }
 
