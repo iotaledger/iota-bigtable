@@ -358,7 +358,7 @@ impl BigTableClient {
                 client
                     .read_rows_internal(request)
                     .await
-                    .map_err(|e| match e.is_permantent() {
+                    .map_err(|e| match e.is_permanent() {
                         true => backoff::Error::permanent(e),
                         false => e.into(),
                     })

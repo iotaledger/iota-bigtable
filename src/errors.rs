@@ -29,7 +29,7 @@ pub enum BigTableClientError {
 impl BigTableClientError {
     /// Returns `true` if the error is permanent one and is not subject to
     /// transient retries, `false` otherwise.
-    pub(crate) fn is_permantent(&self) -> bool {
+    pub(crate) fn is_permanent(&self) -> bool {
         use tonic::Code::*;
 
         if let BigTableClientError::Grpc(status) = &self {
