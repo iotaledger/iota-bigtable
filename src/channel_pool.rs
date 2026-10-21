@@ -55,7 +55,7 @@ pub(crate) trait ChannelPrimer: Send + Sync + 'static {
     ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>>;
 }
 
-/// Sizing and maintenance parameters of the [`ChannelPool`].
+/// Sizing and maintenance parameters of the Connection Pool.
 #[derive(Debug, Clone)]
 pub struct PoolConfig {
     /// Channels opened on connect.
@@ -546,16 +546,9 @@ mod tests {
         }
     }
 
-    async fn start_mock_server() -> (MockBigtableServer, Endpoint, tokio::task::JoinHandle<()>) {
-        let mock = MockBigtableServer::new();
-        let (addr, handle) = mock.start().await.unwrap();
-        let endpoint = Channel::from_shared(format!("http://{addr}")).unwrap();
-        (mock, endpoint, handle)
-    }
-
     #[tokio::test]
     async fn test_pool_creation() {
-        let (_mock, endpoint, _handle) = start_mock_server().await;
+        let server = MockBigtableServer::start().await.unwrap();
         let registry = Registry::new();
 
         let config = PoolConfig {
@@ -564,7 +557,7 @@ mod tests {
             max_pool_size: 10,
             ..PoolConfig::default()
         };
-        let pool = ChannelPool::new(endpoint, config, None, Some(&registry));
+        let pool = ChannelPool::new(server.endpoint(), config, None, Some(&registry));
         pool.connect().await.unwrap();
 
         assert_eq!(metrics(&pool).pool_size.get(), 4);
@@ -572,7 +565,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_pool_creation_with_primer() {
-        let (_mock, endpoint, _handle) = start_mock_server().await;
+        let server = MockBigtableServer::start().await.unwrap();
         let registry = Registry::new();
 
         let config = PoolConfig {
@@ -582,7 +575,7 @@ mod tests {
             ..PoolConfig::default()
         };
         let pool = ChannelPool::new(
-            endpoint,
+            server.endpoint(),
             config,
             Some(Box::new(TestPrimer)),
             Some(&registry),
@@ -594,7 +587,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_round_robin_rpcs() {
-        let (mock, endpoint, _handle) = start_mock_server().await;
+        let server = MockBigtableServer::start().await.unwrap();
         let registry = Registry::new();
 
         let config = PoolConfig {
@@ -604,7 +597,7 @@ mod tests {
             ..PoolConfig::default()
         };
         let pool = ChannelPool::new(
-            endpoint,
+            server.endpoint(),
             config,
             Some(Box::new(TestPrimer)),
             Some(&registry),
@@ -626,7 +619,7 @@ mod tests {
 
         assert_eq!(metrics(&pool).rpcs_completed.get(), n as u64);
         // Mock counts primer pings (2 from connect) + our 6 RPCs.
-        assert_eq!(mock.request_count.load(Ordering::Relaxed), 2 + n);
+        assert_eq!(server.request_count(), 2 + n);
 
         // Verify round-robin: 6 RPCs split evenly across 2 channels.
         let entries = pool.inner.entries.load();
@@ -636,7 +629,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_dynamic_resize() {
-        let (_mock, endpoint, _handle) = start_mock_server().await;
+        let server = MockBigtableServer::start().await.unwrap();
         let registry = Registry::new();
 
         // target_load = (5 + 50) / 2 = 27
@@ -647,7 +640,7 @@ mod tests {
             max_resize_delta: 2,
             ..PoolConfig::default()
         };
-        let pool = ChannelPool::new(endpoint, config, None, Some(&registry));
+        let pool = ChannelPool::new(server.endpoint(), config, None, Some(&registry));
         pool.connect().await.unwrap();
         assert_eq!(metrics(&pool).pool_size.get(), 1);
 
@@ -717,7 +710,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_age_refresh_replaces_old_channels() {
-        let (_mock, endpoint, _handle) = start_mock_server().await;
+        let server = MockBigtableServer::start().await.unwrap();
         let registry = Registry::new();
 
         let config = PoolConfig {
@@ -728,7 +721,7 @@ mod tests {
             refresh_jitter: Duration::ZERO,
             ..PoolConfig::default()
         };
-        let pool = ChannelPool::new(endpoint, config, None, Some(&registry));
+        let pool = ChannelPool::new(server.endpoint(), config, None, Some(&registry));
         pool.connect().await.unwrap();
 
         pool.inner.refresh().await;
@@ -740,7 +733,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_age_refresh_caps_replacements_per_cycle() {
-        let (_mock, endpoint, _handle) = start_mock_server().await;
+        let server = MockBigtableServer::start().await.unwrap();
         let registry = Registry::new();
 
         let config = PoolConfig {
@@ -751,7 +744,7 @@ mod tests {
             refresh_jitter: Duration::ZERO,
             ..PoolConfig::default()
         };
-        let pool = ChannelPool::new(endpoint, config, None, Some(&registry));
+        let pool = ChannelPool::new(server.endpoint(), config, None, Some(&registry));
         pool.connect().await.unwrap();
 
         // All 4 entries are expired, but only MAX_REPLACEMENTS_PER_CYCLE=2

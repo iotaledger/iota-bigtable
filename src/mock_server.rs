@@ -14,7 +14,10 @@ use std::{
 };
 
 use tokio_stream::Stream;
-use tonic::{Request, Response, Status, transport::Server};
+use tonic::{
+    Request, Response, Status,
+    transport::{Channel, Endpoint, Server},
+};
 
 use crate::proto::bigtable::v2::{
     CheckAndMutateRowRequest, CheckAndMutateRowResponse, ExecuteQueryRequest, ExecuteQueryResponse,
@@ -28,33 +31,64 @@ use crate::proto::bigtable::v2::{
 
 type UnimplementedStream<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send>>;
 
+/// The mocked Bigtable gRPC service installed in the tonic server. It shares
+/// the request counter with the [`MockBigtableServerHandle`] returned by
+/// [`start`](Self::start).
 #[derive(Clone, Default)]
 pub(crate) struct MockBigtableServer {
-    /// Number of RPCs received.
-    pub(crate) request_count: Arc<AtomicUsize>,
+    request_count: Arc<AtomicUsize>,
 }
 
 impl MockBigtableServer {
-    pub(crate) fn new() -> Self {
-        Self::default()
-    }
-
-    /// Bind to a random local port and serve in a background task.
-    pub(crate) async fn start(&self) -> std::io::Result<(SocketAddr, tokio::task::JoinHandle<()>)> {
+    /// Binds to a random local port and serves in a background task until the
+    /// returned handle is dropped.
+    pub(crate) async fn start() -> std::io::Result<MockBigtableServerHandle> {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let addr = listener.local_addr()?;
-        let mock = self.clone();
+        let server = Self::default();
+        let request_count = server.request_count.clone();
 
-        let handle = tokio::spawn(async move {
+        let task = tokio::spawn(async move {
             let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
             Server::builder()
-                .add_service(BigtableServer::new(mock))
+                .add_service(BigtableServer::new(server))
                 .serve_with_incoming(incoming)
                 .await
                 .ok();
         });
 
-        Ok((addr, handle))
+        Ok(MockBigtableServerHandle {
+            addr,
+            request_count,
+            task,
+        })
+    }
+}
+
+/// Handle to a running [`MockBigtableServer`] listening on a random local
+/// port. The serving task is aborted when this is dropped, so a test keeps it
+/// alive for as long as the server is needed.
+pub(crate) struct MockBigtableServerHandle {
+    addr: SocketAddr,
+    request_count: Arc<AtomicUsize>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl MockBigtableServerHandle {
+    /// Plain-HTTP endpoint pointing at this server.
+    pub(crate) fn endpoint(&self) -> Endpoint {
+        Channel::from_shared(format!("http://{}", self.addr)).expect("valid loopback URL")
+    }
+
+    /// Number of RPCs received so far.
+    pub(crate) fn request_count(&self) -> usize {
+        self.request_count.load(Ordering::Relaxed)
+    }
+}
+
+impl Drop for MockBigtableServerHandle {
+    fn drop(&mut self) {
+        self.task.abort();
     }
 }
 
