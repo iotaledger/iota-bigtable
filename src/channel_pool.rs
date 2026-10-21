@@ -18,6 +18,7 @@
 
 use std::{
     future::Future,
+    num::NonZeroUsize,
     pin::Pin,
     sync::{
         Arc,
@@ -56,31 +57,45 @@ pub(crate) trait ChannelPrimer: Send + Sync + 'static {
 }
 
 /// Sizing and maintenance parameters of the Connection Pool.
+///
+/// # Example
+///
+/// ```rust
+/// # use iota_bigtable::PoolConfig;
+/// let config = PoolConfig::new().initial_pool_size(4)?.max_pool_size(10)?;
+/// # Ok::<(), iota_bigtable::errors::BigTableClientError>(())
+/// ```
 #[derive(Debug, Clone)]
 pub struct PoolConfig {
     /// Channels opened on connect.
-    pub initial_pool_size: usize,
+    initial_pool_size: usize,
     /// Lower bound the pool never shrinks below.
-    pub min_pool_size: usize,
+    min_pool_size: usize,
     /// Upper bound the pool never grows above.
-    pub max_pool_size: usize,
+    max_pool_size: usize,
     /// Average in-flight RPCs per channel below which the pool shrinks.
-    pub min_rpcs_per_channel: usize,
+    min_rpcs_per_channel: usize,
     /// Average in-flight RPCs per channel at or above which the pool grows.
-    pub max_rpcs_per_channel: usize,
+    max_rpcs_per_channel: usize,
     /// Maximum channels removed in one shrink step.
-    pub max_resize_delta: usize,
+    max_resize_delta: usize,
     /// Consecutive low-load cycles required before shrinking.
-    pub downscale_threshold: usize,
+    downscale_threshold: usize,
     /// Period of the background refresh/resize loop.
-    pub maintenance_interval: Duration,
+    maintenance_interval: Duration,
     /// Age after which a channel is replaced.
-    pub refresh_age: Duration,
+    refresh_age: Duration,
     /// Random extra delay added to `refresh_age` per channel.
-    pub refresh_jitter: Duration,
+    refresh_jitter: Duration,
 }
 
 impl PoolConfig {
+    /// Creates a config with production-ready defaults. Use the setters to
+    /// override individual values.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
     /// Represents a single-channel pool with no scaling, for testing or local
     /// use.
     pub fn singleton() -> Self {
@@ -91,6 +106,86 @@ impl PoolConfig {
             ..Self::default()
         }
     }
+
+    /// Sets the number of channels opened on connect.
+    pub fn initial_pool_size(mut self, value: impl TryInto<NonZeroUsize>) -> Result<Self> {
+        self.initial_pool_size = non_zero(value, "initial_pool_size")?;
+        Ok(self)
+    }
+
+    /// Sets the lower bound the pool never shrinks below.
+    pub fn min_pool_size(mut self, value: impl TryInto<NonZeroUsize>) -> Result<Self> {
+        self.min_pool_size = non_zero(value, "min_pool_size")?;
+        Ok(self)
+    }
+
+    /// Sets the upper bound the pool never grows above.
+    pub fn max_pool_size(mut self, value: impl TryInto<NonZeroUsize>) -> Result<Self> {
+        self.max_pool_size = non_zero(value, "max_pool_size")?;
+        Ok(self)
+    }
+
+    /// Sets the average in-flight RPCs per channel below which the pool
+    /// shrinks. Zero means the pool only shrinks when fully idle.
+    pub fn min_rpcs_per_channel(mut self, value: usize) -> Self {
+        self.min_rpcs_per_channel = value;
+        self
+    }
+
+    /// Sets the average in-flight RPCs per channel at or above which the pool
+    /// grows.
+    pub fn max_rpcs_per_channel(mut self, value: impl TryInto<NonZeroUsize>) -> Result<Self> {
+        self.max_rpcs_per_channel = non_zero(value, "max_rpcs_per_channel")?;
+        Ok(self)
+    }
+
+    /// Sets the maximum channels removed in one shrink step.
+    pub fn max_resize_delta(mut self, value: impl TryInto<NonZeroUsize>) -> Result<Self> {
+        self.max_resize_delta = non_zero(value, "max_resize_delta")?;
+        Ok(self)
+    }
+
+    /// Sets the consecutive low-load cycles required before shrinking.
+    pub fn downscale_threshold(mut self, value: impl TryInto<NonZeroUsize>) -> Result<Self> {
+        self.downscale_threshold = non_zero(value, "downscale_threshold")?;
+        Ok(self)
+    }
+
+    /// Sets the period of the background refresh/resize loop. A zero
+    /// duration is rejected.
+    pub fn maintenance_interval(mut self, value: Duration) -> Result<Self> {
+        if value.is_zero() {
+            return Err(BigTableClientError::InvalidPoolConfig(
+                "`maintenance_interval` must be greater than zero".into(),
+            ));
+        }
+        self.maintenance_interval = value;
+        Ok(self)
+    }
+
+    /// Sets the age after which a channel is replaced.
+    ///
+    /// A zero duration causes constant reconnection and is only useful in
+    /// tests. Keep this well above the maintenance interval in production.
+    pub fn refresh_age(mut self, value: Duration) -> Self {
+        self.refresh_age = value;
+        self
+    }
+
+    /// Sets the random extra delay added to `refresh_age` per channel. Zero
+    /// disables jitter.
+    pub fn refresh_jitter(mut self, value: Duration) -> Self {
+        self.refresh_jitter = value;
+        self
+    }
+}
+
+/// Converts a setter argument to `usize`, rejecting zero with a
+/// [`BigTableClientError::InvalidPoolConfig`] naming the offending field.
+fn non_zero(value: impl TryInto<NonZeroUsize>, field: &str) -> Result<usize> {
+    value.try_into().map(NonZeroUsize::get).map_err(|_| {
+        BigTableClientError::InvalidPoolConfig(format!("`{field}` must be greater than zero"))
+    })
 }
 
 impl Default for PoolConfig {
@@ -359,6 +454,7 @@ impl ChannelPoolInner {
         }
     }
 
+    /// Computes the deadline at which a channel should be replaced.
     fn compute_refresh_at(refresh_age: Duration, refresh_jitter: Duration) -> Instant {
         let jitter = if refresh_jitter.is_zero() {
             Duration::ZERO
@@ -370,6 +466,12 @@ impl ChannelPoolInner {
         Instant::now() + refresh_age + jitter
     }
 
+    /// Opens, primes and wraps a new channel. This is the single place every
+    /// pool entry is created, whether on connect, age refresh or scale-up.
+    ///
+    /// A connection failure is returned to the caller. A priming failure is
+    /// only logged, since the channel still works and merely pays the warm-up
+    /// cost on its first real request.
     async fn create_primed_entry(&self) -> Result<PoolEntry> {
         let channel = self.endpoint.connect().await?;
         if let Some(primer) = self.primer.as_deref()
@@ -546,6 +648,44 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_config_setters_reject_zero() {
+        let config = PoolConfig::default()
+            .initial_pool_size(4)
+            .unwrap()
+            .min_pool_size(2)
+            .unwrap()
+            .max_pool_size(NonZeroUsize::new(8).unwrap())
+            .unwrap()
+            .min_rpcs_per_channel(0);
+        assert_eq!(config.initial_pool_size, 4);
+        assert_eq!(config.min_pool_size, 2);
+        assert_eq!(config.max_pool_size, 8);
+        assert_eq!(config.min_rpcs_per_channel, 0);
+
+        let err = PoolConfig::default().initial_pool_size(0).unwrap_err();
+        assert!(
+            matches!(err, BigTableClientError::InvalidPoolConfig(ref m) if m.contains("initial_pool_size")),
+            "unexpected error: {err}"
+        );
+        assert!(PoolConfig::default().max_resize_delta(0).is_err());
+        assert!(PoolConfig::default().downscale_threshold(0).is_err());
+        assert!(
+            PoolConfig::default()
+                .maintenance_interval(Duration::ZERO)
+                .is_err()
+        );
+
+        let config = PoolConfig::default()
+            .maintenance_interval(Duration::from_secs(5))
+            .unwrap()
+            .refresh_age(Duration::from_secs(1))
+            .refresh_jitter(Duration::ZERO);
+        assert_eq!(config.maintenance_interval, Duration::from_secs(5));
+        assert_eq!(config.refresh_age, Duration::from_secs(1));
+        assert_eq!(config.refresh_jitter, Duration::ZERO);
+    }
+
     #[tokio::test]
     async fn test_pool_creation() {
         let server = MockBigtableServer::start().await.unwrap();
@@ -605,7 +745,7 @@ mod tests {
         pool.connect().await.unwrap();
 
         // Send RPCs through the pool via PingAndWarm.
-        let n = 6usize;
+        let n = 6;
         for _ in 0..n {
             let mut client = BigtableInternalClient::new(pool.clone());
             client
