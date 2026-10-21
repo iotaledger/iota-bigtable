@@ -29,11 +29,12 @@ use tonic::{
 use tracing::{debug, warn};
 
 use crate::{
+    channel_pool::{ChannelPool, ChannelPrimer, PoolConfig},
     errors::{BigTableClientError, Result},
     metrics::Metrics,
     proto::bigtable::v2::{
-        MutateRowsRequest, MutateRowsResponse, Mutation, ReadRowsRequest, RowFilter, RowRange,
-        RowSet,
+        MutateRowsRequest, MutateRowsResponse, Mutation, PingAndWarmRequest, ReadRowsRequest,
+        RowFilter, RowRange, RowSet,
         bigtable_client::BigtableClient as BigtableInternalClient,
         mutate_rows_request::Entry,
         mutation::{self, SetCell},
@@ -48,9 +49,6 @@ const MAX_MUTATIONS_PER_MUTATE_ROWS_REQUEST: usize = 100_000;
 const BIGTABLE_POLICY: &str = "https://www.googleapis.com/auth/bigtable.data";
 const BIGTABLE_API: &str = "https://bigtable.googleapis.com";
 const BIGTABLE_DOMAIN: &str = "bigtable.googleapis.com";
-
-/// Maximum allowed number of connections in the connection pool.
-const POOL_SIZE: usize = 10;
 
 /// The maximum allowed elapsed time in seconds for transient errors.
 const TRANSIENT_ERRORS_MAX_ELAPSED_TIME_SECS: Duration = Duration::from_secs(10);
@@ -127,7 +125,7 @@ impl Backoff for BackoffPolicy {
 #[derive(Clone)]
 pub struct BigTableClient {
     /// gRPC client for interacting with Google BigTable.
-    client: BigtableInternalClient<AuthChannel>,
+    client: BigtableInternalClient<AuthChannel<ChannelPool>>,
     /// Client name for logging and metrics.
     client_name: String,
     /// Column family name for interacting with Google BigTable.
@@ -146,14 +144,16 @@ impl BigTableClient {
     ///
     /// `host` is expected in `host:port` form without a scheme (e.g.
     /// `127.0.0.1:8086`), the client then connects over plain HTTP.
-    pub fn new_local(
+    pub async fn new_local(
         host: impl AsRef<str>,
         client_name: impl Into<String>,
         instance_id: impl AsRef<str>,
         column_family: impl Into<String>,
     ) -> Result<Self> {
-        let channel = Channel::from_shared(format!("http://{}", host.as_ref()))?.connect_lazy();
-        let auth_channel = AuthChannel::new_localhost(channel, BIGTABLE_POLICY);
+        let endpoint = Channel::from_shared(format!("http://{}", host.as_ref()))?;
+        let pool =
+            ChannelPool::new_connected(endpoint, PoolConfig::singleton(), None, None).await?;
+        let auth_channel = AuthChannel::new_localhost(pool, BIGTABLE_POLICY);
 
         Ok(Self {
             table_prefix: format!(
@@ -192,13 +192,19 @@ impl BigTableClient {
     ///    variable to the path of a PEM-encoded CA certificate file.
     /// 2. **System Certificate Store**: Uses the platform's native trusted
     ///    certificate store (automatically handles certificate rotation).
+    ///
+    /// # Connection Pool
+    /// RPCs are spread over a pool of gRPC channels sized by `pool_config`. The
+    /// pool grows and shrinks with load and replaces channels before Google
+    /// reaps them. [`PoolConfig::default`] is a sane starting point.
     pub async fn new_remote(
         instance_id: impl AsRef<str>,
         is_read_only: bool,
-        timeout: Option<Duration>,
+        timeout: impl Into<Option<Duration>>,
         client_name: impl Into<String>,
         column_family: impl Into<String>,
-        registry: Option<&Registry>,
+        registry: impl Into<Option<&Registry>>,
+        pool_config: PoolConfig,
     ) -> Result<Self> {
         let policy = is_read_only
             .then_some(format!("{BIGTABLE_POLICY}.readonly"))
@@ -215,23 +221,30 @@ impl BigTableClient {
 
         // Create a shared endpoint with keep-alive and TLS configuration.
         let mut endpoint = Endpoint::from_static(BIGTABLE_API)
-            .http2_keep_alive_interval(Duration::from_secs(60))
+            .http2_keep_alive_interval(Duration::from_secs(30))
+            .keep_alive_timeout(Duration::from_secs(10))
             .keep_alive_while_idle(true)
             .tls_config(tls_config)?;
-        if let Some(timeout) = timeout {
+        if let Some(timeout) = timeout.into() {
             endpoint = endpoint.timeout(timeout);
         }
 
-        // Create a channel pool with the shared endpoint.
-        let endpoints = std::iter::repeat_n(endpoint, POOL_SIZE);
-        let channel_pool = Channel::balance_list(endpoints);
-
-        let table_prefix = format!(
-            "projects/{}/instances/{}/tables/",
+        let instance_name = format!(
+            "projects/{}/instances/{}",
             token_provider.project_id().await?,
             instance_id.as_ref()
         );
-        let auth_channel = AuthChannel::new_remote(channel_pool, policy, token_provider);
+        let table_prefix = format!("{instance_name}/tables/");
+        let primer = BigtablePrimer {
+            instance_name,
+            policy: policy.clone(),
+            token_provider: token_provider.clone(),
+        };
+        let registry = registry.into();
+        let pool =
+            ChannelPool::new_connected(endpoint, pool_config, Some(Box::new(primer)), registry)
+                .await?;
+        let auth_channel = AuthChannel::new_remote(pool, policy, token_provider);
         Ok(Self {
             table_prefix,
             client: BigtableInternalClient::new(auth_channel),
@@ -678,9 +691,9 @@ impl BigTableClient {
 /// Used internally by `BigTableClient` to ensure all requests are properly
 /// authorized and feature-enabled when communicating with Google Bigtable.
 #[derive(Clone)]
-struct AuthChannel {
-    // The underlying gRPC channel used for communication.
-    channel: Channel,
+struct AuthChannel<S> {
+    // The underlying gRPC service used for communication.
+    channel: S,
     // The access policy (scope) for which tokens are requested.
     policy: String,
     // Provides tokens for authentication.
@@ -689,10 +702,10 @@ struct AuthChannel {
     token: Arc<RwLock<Option<Arc<Token>>>>,
 }
 
-impl AuthChannel {
+impl<S> AuthChannel<S> {
     /// Creates a new `AuthChannel` for localhost communication. It does not
     /// require authentication.
-    fn new_localhost(channel: Channel, policy: impl Into<String>) -> Self {
+    fn new_localhost(channel: S, policy: impl Into<String>) -> Self {
         Self {
             channel,
             policy: policy.into(),
@@ -704,7 +717,7 @@ impl AuthChannel {
     /// Creates a new `AuthChannel` for remote communication. It requires
     /// authentication.
     fn new_remote(
-        channel: Channel,
+        channel: S,
         policy: impl Into<String>,
         token_provider: Arc<dyn TokenProvider>,
     ) -> Self {
@@ -728,7 +741,12 @@ impl AuthChannel {
     }
 }
 
-impl Service<Request<Body>> for AuthChannel {
+impl<S> Service<Request<Body>> for AuthChannel<S>
+where
+    S: Service<Request<Body>, Response = Response<Body>> + Clone + Send + 'static,
+    S::Future: Send,
+    S::Error: Into<BigTableClientError>,
+{
     type Response = Response<Body>;
     type Error = BigTableClientError;
     type Future = Pin<Box<dyn Future<Output = Result<Self::Response>> + Send>>;
@@ -750,9 +768,9 @@ impl Service<Request<Body>> for AuthChannel {
         let auth_token = self.cached_token();
 
         Box::pin(async move {
-            // if a token provider exists, ensure a valid token is present and then
-            // if no valid token cached, fetch a new one and cache it, otherwise use the
-            // cached valid token.
+            // if a token provider exists, ensure a valid token is present and
+            // then if no valid token cached, fetch a new one and
+            // cache it, otherwise use the cached valid token.
             if let Some(ref provider) = token_provider {
                 let token = match auth_token {
                     None => {
@@ -767,12 +785,44 @@ impl Service<Request<Body>> for AuthChannel {
                 let header = HeaderValue::from_str(&format!("Bearer {}", token.as_str()))?;
                 request.headers_mut().insert("authorization", header);
             }
-            // always insert the Bigtable features header (e.g., to enable reverse scan).
+            // always insert the Bigtable features header (e.g., to enable
+            // reverse scan).
             let header = HeaderValue::from_static("CAE=");
             request.headers_mut().insert("bigtable-features", header);
 
-            // forward the request to the underlying channel and return the response.
-            Ok(inner.call(request).await?)
+            // forward the request to the underlying channel and return the
+            // response.
+            inner.call(request).await.map_err(Into::into)
+        })
+    }
+}
+
+/// Warms each new pool channel with a `PingAndWarm` RPC call so the first real
+/// request does not pay the connection setup cost.
+struct BigtablePrimer {
+    instance_name: String,
+    policy: String,
+    token_provider: Arc<dyn TokenProvider>,
+}
+
+impl ChannelPrimer for BigtablePrimer {
+    fn prime<'a>(
+        &'a self,
+        channel: &'a Channel,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
+        Box::pin(async move {
+            let auth_channel = AuthChannel::new_remote(
+                channel.clone(),
+                self.policy.clone(),
+                self.token_provider.clone(),
+            );
+            BigtableInternalClient::new(auth_channel)
+                .ping_and_warm(PingAndWarmRequest {
+                    name: self.instance_name.clone(),
+                    app_profile_id: String::new(),
+                })
+                .await?;
+            Ok(())
         })
     }
 }

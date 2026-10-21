@@ -24,6 +24,8 @@ pub enum BigTableClientError {
     InvalidHeaderValue(#[from] http::header::InvalidHeaderValue),
     #[error("io error: `{0}`")]
     Io(#[from] std::io::Error),
+    #[error("invalid pool config: {0}")]
+    InvalidPoolConfig(String),
 }
 
 impl BigTableClientError {

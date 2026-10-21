@@ -6,17 +6,24 @@ edition = "2024"
 license = "Apache-2.0"
 
 [dependencies]
+arc-swap = "1"
 backoff = { version = "0.4.0", features = ["futures", "tokio"] }
 gcp_auth = "0.12.5"
 http = "1"
 prometheus = "0.14"
 prost = "0.14"
 prost-types = "0.14"
+rand = "0.8"
 tonic-prost = "0.14"
 serde = { version = "1.0.144", features = ["derive"] }
 thiserror = "2.0.12"
 tonic = { version = "0.14", features = ["tls-native-roots"] }
+tokio = { version = "1", features = ["rt", "time"] }
 tracing = "0.1.44"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "net"] }
+tokio-stream = { version = "0.1", features = ["net"] }
 
 [build-dependencies]
 tonic-prost-build = { version = "0.14" }
