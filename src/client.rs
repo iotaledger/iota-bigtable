@@ -200,10 +200,10 @@ impl BigTableClient {
     pub async fn new_remote(
         instance_id: impl AsRef<str>,
         is_read_only: bool,
-        timeout: Option<Duration>,
+        timeout: impl Into<Option<Duration>>,
         client_name: impl Into<String>,
         column_family: impl Into<String>,
-        registry: Option<&Registry>,
+        registry: impl Into<Option<&Registry>>,
         pool_config: PoolConfig,
     ) -> Result<Self> {
         let policy = is_read_only
@@ -225,7 +225,7 @@ impl BigTableClient {
             .keep_alive_timeout(Duration::from_secs(10))
             .keep_alive_while_idle(true)
             .tls_config(tls_config)?;
-        if let Some(timeout) = timeout {
+        if let Some(timeout) = timeout.into() {
             endpoint = endpoint.timeout(timeout);
         }
 
@@ -240,6 +240,7 @@ impl BigTableClient {
             policy: policy.clone(),
             token_provider: token_provider.clone(),
         };
+        let registry = registry.into();
         let pool =
             ChannelPool::new_connected(endpoint, pool_config, Some(Box::new(primer)), registry)
                 .await?;
