@@ -455,13 +455,12 @@ impl Service<Request<Body>> for ChannelPool {
             let guard = InFlightGuard {
                 entry: entry.clone(),
             };
-            let result = channel.call(request).await;
-            if let Some(m) = &metrics {
-                m.rpcs_completed.inc();
-            }
-            match result {
+            match channel.call(request).await {
                 Ok(response) => {
                     entry.success_count.fetch_add(1, Ordering::Relaxed);
+                    if let Some(m) = &metrics {
+                        m.rpcs_completed.inc();
+                    }
                     // Move the guard into the body so `in_flight` stays
                     // accurate for the lifetime of the HTTP/2 stream, not
                     // just until the headers arrive.
