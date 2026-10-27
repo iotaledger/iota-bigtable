@@ -26,7 +26,7 @@ pub enum BigTableClientError {
     Io(#[from] std::io::Error),
     #[error("invalid pool config: {0}")]
     InvalidPoolConfig(String),
-    #[error("connecting to BigTable timed out")]
+    #[error("establishing a BigTable channel timed out")]
     ConnectTimeout,
 }
 
