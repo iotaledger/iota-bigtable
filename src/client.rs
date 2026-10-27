@@ -250,7 +250,9 @@ impl BigTableClient {
         let table_prefix = format!("{instance_name}/tables/");
         let primer = BigTablePrimer {
             instance_name,
-            policy: policy.clone(),
+            // PingAndWarm only accepts the read-write data scope, so the
+            // primer uses it even for read-only clients.
+            policy: BIGTABLE_POLICY.to_string(),
             token_provider: token_provider.clone(),
         };
         let registry = registry.into();
