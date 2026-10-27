@@ -548,6 +548,9 @@ impl ChannelPoolInner {
                     }
                 }
                 let new_size = new_entries.len();
+                if new_size == current_size {
+                    return;
+                }
                 info!(
                     current_size,
                     new_size, total_in_flight, "pool resize: expanded"
