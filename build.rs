@@ -12,8 +12,8 @@ fn main() -> Result<()> {
     println!("cargo:rerun-if-changed=build.rs");
 
     tonic_prost_build::configure()
-        // the server is on google side, we don't need code generation for it.
-        .build_server(false)
+        // server codegen is only used by the test mock server.
+        .build_server(true)
         .compile_protos(
             &[Path::new(GOOGLEAPIS_SUBMODULE_PATH).join(BIGTABLE_V2_PROTO_PATH)],
             &[GOOGLEAPIS_SUBMODULE_PATH.into()],

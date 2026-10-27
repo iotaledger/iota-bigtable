@@ -652,6 +652,8 @@ dependencies = [
  "prost-types",
  "serde",
  "thiserror 2.0.12",
+ "tokio",
+ "tokio-stream",
  "tonic",
  "tonic-prost",
  "tonic-prost-build",
