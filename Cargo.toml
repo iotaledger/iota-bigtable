@@ -30,6 +30,7 @@ test-server = []
 [dev-dependencies]
 # Enables the test-server feature for `cargo test` without affecting normal builds.
 iota-bigtable = { path = ".", features = ["test-server"] }
+rstest = "0.28"
 tokio = { version = "1", features = ["macros", "net"] }
 tokio-stream = { version = "0.1", features = ["net"] }
 
