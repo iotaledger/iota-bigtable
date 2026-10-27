@@ -647,6 +647,7 @@ dependencies = [
  "backoff",
  "gcp_auth",
  "http",
+ "iota-bigtable",
  "prometheus",
  "prost",
  "prost-types",
