@@ -12,8 +12,9 @@ fn main() -> Result<()> {
     println!("cargo:rerun-if-changed=build.rs");
 
     tonic_prost_build::configure()
-        // server codegen is only used by the test mock server.
-        .build_server(true)
+        // server codegen is only used by the test mock server, see the
+        // `test-server` feature.
+        .build_server(std::env::var_os("CARGO_FEATURE_TEST_SERVER").is_some())
         .compile_protos(
             &[Path::new(GOOGLEAPIS_SUBMODULE_PATH).join(BIGTABLE_V2_PROTO_PATH)],
             &[GOOGLEAPIS_SUBMODULE_PATH.into()],
