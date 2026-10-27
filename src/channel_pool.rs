@@ -21,7 +21,7 @@ use std::{
         atomic::{AtomicUsize, Ordering},
     },
     task::{Context, Poll},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use arc_swap::ArcSwap;
@@ -38,6 +38,7 @@ use tonic::{
     codegen::Service,
     transport::{Channel, Endpoint},
 };
+use tracing::{debug, info};
 
 use crate::errors::{BigTableClientError, Result};
 
@@ -209,10 +210,16 @@ impl ChannelPool {
 
     /// Connect `initial_pool_size` channels, priming each one.
     pub(crate) async fn connect(&self) -> Result<()> {
+        let start = Instant::now();
         let mut entries = Vec::with_capacity(self.inner.config.initial_pool_size);
         for _ in 0..self.inner.config.initial_pool_size {
             entries.push(Arc::new(self.inner.create_primed_entry().await?));
         }
+        info!(
+            channels = entries.len(),
+            elapsed = ?start.elapsed(),
+            "bigtable channel pool connected"
+        );
         if let Some(m) = &self.inner.metrics {
             m.pool_size.set(entries.len() as i64);
         }
@@ -269,9 +276,13 @@ impl ChannelPoolInner {
     /// official Go client.
     async fn create_primed_entry(&self) -> Result<PoolEntry> {
         let timeout = self.config.channel_init_timeout;
+        let start = Instant::now();
         let channel = tokio::time::timeout(timeout, self.endpoint.connect()).await??;
+        debug!(elapsed = ?start.elapsed(), "bigtable channel connected");
         if let Some(primer) = self.primer.as_deref() {
+            let start = Instant::now();
             tokio::time::timeout(timeout, primer.prime(&channel)).await??;
+            debug!(elapsed = ?start.elapsed(), "bigtable channel primed");
         }
         Ok(PoolEntry {
             channel,
