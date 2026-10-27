@@ -4,9 +4,6 @@
 
 //! Minimal BigTable gRPC server for channel pool tests.
 
-// TODO: Nothing uses the mock yet. Remove once the channel pool tests land.
-#![allow(dead_code)]
-
 use std::{
     net::SocketAddr,
     pin::Pin,
