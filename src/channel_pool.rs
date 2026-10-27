@@ -356,6 +356,8 @@ impl ChannelPool {
         let period = self.inner.config.maintenance_interval;
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(period);
+            // A slow cycle must not be followed by a burst of catch-up cycles.
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             interval.tick().await; // first tick completes immediately
             loop {
                 interval.tick().await;
