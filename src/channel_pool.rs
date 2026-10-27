@@ -513,6 +513,9 @@ impl ChannelPoolInner {
             let new_len = current_size
                 .saturating_sub(delta)
                 .max(self.config.min_pool_size);
+            // Drop the channels closest to their refresh deadline so refresh
+            // has less to replace later.
+            new_entries.sort_by_key(|e| std::cmp::Reverse(e.refresh_at));
             new_entries.truncate(new_len);
             info!(
                 current_size,
