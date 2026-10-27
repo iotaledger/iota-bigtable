@@ -818,3 +818,338 @@ impl Service<Request<Body>> for ChannelPool {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use prometheus::Registry;
+    use rstest::rstest;
+
+    use super::*;
+    use crate::{
+        mock_server::MockBigTableServer,
+        proto::bigtable::v2::{
+            PingAndWarmRequest, ReadRowsRequest,
+            bigtable_client::BigtableClient as BigtableInternalClient,
+        },
+    };
+
+    fn metrics(pool: &ChannelPool) -> &Metrics {
+        pool.inner.metrics.as_ref().expect("metrics not configured")
+    }
+
+    struct TestPrimer;
+
+    impl ChannelPrimer for TestPrimer {
+        fn prime<'a>(
+            &'a self,
+            channel: &'a Channel,
+        ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
+            Box::pin(async move {
+                let mut client = BigtableInternalClient::new(channel.clone());
+                client
+                    .ping_and_warm(PingAndWarmRequest {
+                        name: String::new(),
+                        app_profile_id: String::new(),
+                    })
+                    .await?;
+                Ok(())
+            })
+        }
+    }
+
+    /// A primer whose future never completes.
+    struct HangingPrimer;
+
+    impl ChannelPrimer for HangingPrimer {
+        fn prime<'a>(
+            &'a self,
+            _channel: &'a Channel,
+        ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
+            Box::pin(std::future::pending())
+        }
+    }
+
+    #[rstest]
+    #[case::initial_pool_size(PoolConfig::default().initial_pool_size(0), "initial_pool_size")]
+    #[case::max_resize_delta(PoolConfig::default().max_resize_delta(0), "max_resize_delta")]
+    #[case::downscale_threshold(PoolConfig::default().downscale_threshold(0), "downscale_threshold")]
+    #[case::maintenance_interval(PoolConfig::default().maintenance_interval(Duration::ZERO), "maintenance_interval")]
+    #[case::channel_init_timeout(PoolConfig::default().channel_init_timeout(Duration::ZERO), "channel_init_timeout")]
+    fn test_config_rejects_zero(#[case] result: Result<PoolConfig>, #[case] field: &str) {
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            format!("invalid pool config: `{field}` must be greater than zero")
+        );
+    }
+
+    fn valid_config() -> PoolConfig {
+        PoolConfig::default()
+            .min_pool_size(2)
+            .unwrap()
+            .initial_pool_size(4)
+            .unwrap()
+            .max_pool_size(8)
+            .unwrap()
+            .min_rpcs_per_channel(0)
+            .max_rpcs_per_channel(50)
+            .unwrap()
+    }
+
+    const SIZE_MSG: &str =
+        "invalid pool config: `min_pool_size` <= `initial_pool_size` <= `max_pool_size` must hold";
+    const RPCS_MSG: &str =
+        "invalid pool config: `min_rpcs_per_channel` must be less than `max_rpcs_per_channel`";
+
+    #[test]
+    fn test_config_validate_accepts_consistent_bounds() {
+        assert!(valid_config().validate().is_ok());
+    }
+
+    #[rstest]
+    #[case::min_above_initial(valid_config().min_pool_size(5).unwrap(), SIZE_MSG)]
+    #[case::max_below_initial(valid_config().max_pool_size(3).unwrap(), SIZE_MSG)]
+    #[case::min_rpcs_not_below_max(valid_config().min_rpcs_per_channel(50), RPCS_MSG)]
+    fn test_config_validate_rejects(#[case] config: PoolConfig, #[case] msg: &str) {
+        assert_eq!(config.validate().unwrap_err().to_string(), msg);
+    }
+
+    #[rstest]
+    #[case::zero(Duration::ZERO)]
+    #[case::sub_millisecond(Duration::from_micros(500))]
+    #[case::five_minutes(Duration::from_secs(300))]
+    fn test_compute_refresh_at_bounds_jitter(#[case] jitter: Duration) {
+        let age = Duration::from_secs(45 * 60);
+        let before = Instant::now();
+        let at = ChannelPoolInner::compute_refresh_at(age, jitter);
+        assert!(at >= before + age);
+        assert!(at <= Instant::now() + age + jitter);
+    }
+
+    #[tokio::test]
+    async fn test_prime_timeout_fails_entry() {
+        let server = MockBigTableServer::start().await.unwrap();
+        let registry = Registry::new();
+
+        let config = PoolConfig {
+            initial_pool_size: 1,
+            min_pool_size: 1,
+            max_pool_size: 10,
+            channel_init_timeout: Duration::from_millis(100),
+            ..PoolConfig::default()
+        };
+        let pool = ChannelPool::new(
+            server.endpoint(),
+            config,
+            Some(Box::new(HangingPrimer)),
+            Some(&registry),
+        );
+
+        // The primer never completes. Without the bound this would hang
+        // forever; with it, the entry fails and nothing enters the pool.
+        let err = tokio::time::timeout(Duration::from_secs(2), pool.connect())
+            .await
+            .expect("connect must not block on a hanging primer")
+            .unwrap_err();
+        assert!(
+            matches!(err, BigTableClientError::ConnectTimeout),
+            "unexpected error: {err}"
+        );
+        assert_eq!(metrics(&pool).pool_size.get(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_round_robin_rpcs() {
+        let server = MockBigTableServer::start().await.unwrap();
+        let registry = Registry::new();
+
+        let config = PoolConfig {
+            initial_pool_size: 2,
+            min_pool_size: 1,
+            max_pool_size: 10,
+            ..PoolConfig::default()
+        };
+        let pool = ChannelPool::new(
+            server.endpoint(),
+            config,
+            Some(Box::new(TestPrimer)),
+            Some(&registry),
+        );
+        pool.connect().await.unwrap();
+
+        // Send RPCs through the pool via PingAndWarm.
+        let n = 6;
+        for _ in 0..n {
+            let mut client = BigtableInternalClient::new(pool.clone());
+            client
+                .ping_and_warm(PingAndWarmRequest {
+                    name: String::new(),
+                    app_profile_id: String::new(),
+                })
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(metrics(&pool).rpcs_completed.get(), n as u64);
+        // Mock counts primer pings (2 from connect) + our 6 RPCs.
+        assert_eq!(server.request_count(), 2 + n);
+
+        // Verify round-robin: 6 RPCs split evenly across 2 channels.
+        let entries = pool.inner.entries.load();
+        assert_eq!(entries[0].success_count.load(Ordering::Relaxed), 3);
+        assert_eq!(entries[1].success_count.load(Ordering::Relaxed), 3);
+    }
+
+    #[tokio::test]
+    async fn test_in_flight_counts_open_streams() {
+        let server = MockBigTableServer::start().await.unwrap();
+        let registry = Registry::new();
+
+        let pool = ChannelPool::new(
+            server.endpoint(),
+            PoolConfig::singleton(),
+            None,
+            Some(&registry),
+        );
+        pool.connect().await.unwrap();
+        let entry = pool.inner.entries.load()[0].clone();
+
+        let mut client = BigtableInternalClient::new(pool.clone());
+
+        // Case 1: the stream is read to completion. The slot is released
+        // when the final frame arrives, before the handle is dropped.
+        let mut stream = client
+            .read_rows(ReadRowsRequest::default())
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(stream.message().await.unwrap().is_some());
+        assert_eq!(entry.in_flight.load(Ordering::Relaxed), 1);
+        assert!(stream.message().await.unwrap().is_some());
+        assert_eq!(entry.in_flight.load(Ordering::Relaxed), 1);
+        assert!(stream.message().await.unwrap().is_none());
+        // The trailers closed the HTTP/2 stream, so the slot is released
+        // even though the handle is still alive.
+        assert_eq!(entry.in_flight.load(Ordering::Relaxed), 0);
+        drop(stream);
+        assert_eq!(entry.in_flight.load(Ordering::Relaxed), 0);
+
+        // Case 2: the caller stops reading mid-stream. Dropping the handle
+        // releases the slot.
+        let mut stream = client
+            .read_rows(ReadRowsRequest::default())
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(stream.message().await.unwrap().is_some());
+        assert_eq!(entry.in_flight.load(Ordering::Relaxed), 1);
+        drop(stream);
+        assert_eq!(entry.in_flight.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn test_dynamic_resize() {
+        let server = MockBigTableServer::start().await.unwrap();
+        let registry = Registry::new();
+
+        // target_load = (5 + 50) / 2 = 27.5
+        let config = PoolConfig {
+            initial_pool_size: 1,
+            min_pool_size: 1,
+            max_pool_size: 10,
+            max_resize_delta: 2,
+            ..PoolConfig::default()
+        };
+        let pool = ChannelPool::new(server.endpoint(), config, None, Some(&registry));
+        pool.connect().await.unwrap();
+        assert_eq!(metrics(&pool).pool_size.get(), 1);
+
+        let set_total_in_flight = |n: usize| {
+            let entries = pool.inner.entries.load();
+            // Put all load on entry[0], zero the rest.
+            for (i, e) in entries.iter().enumerate() {
+                e.in_flight
+                    .store(if i == 0 { n } else { 0 }, Ordering::Relaxed);
+            }
+        };
+
+        // Scale up: 1 channel with 100 in-flight → load=100 ≥ 50.
+        // target = ceil(100/27.5) = 4, delta = 3 (uncapped). Pool: 1 → 4.
+        set_total_in_flight(100);
+        pool.inner.resize().await;
+        assert_eq!(metrics(&pool).pool_size.get(), 4);
+
+        // Scale up again: load=200/4=50 ≥ 50.
+        // target = ceil(200/27.5) = 8, delta = 4. Pool: 4 → 8.
+        set_total_in_flight(200);
+        pool.inner.resize().await;
+        assert_eq!(metrics(&pool).pool_size.get(), 8);
+
+        // Remove load. Scale down requires downscale_threshold (default 3)
+        // consecutive low-load observations before actually shrinking, then
+        // is capped by max_resize_delta=2.
+        set_total_in_flight(0);
+
+        // First two low-load observations: no shrink yet (threshold not met).
+        pool.inner.resize().await;
+        assert_eq!(metrics(&pool).pool_size.get(), 8);
+        pool.inner.resize().await;
+        assert_eq!(metrics(&pool).pool_size.get(), 8);
+
+        // Third consecutive low-load observation crosses the threshold.
+        // load=0 ≤ 5 → target=max(ceil(0/27.5),1)=1, delta=min(8-1,2)=2. Pool:
+        // 8 → 6.
+        pool.inner.resize().await;
+        assert_eq!(metrics(&pool).pool_size.get(), 6);
+
+        // Counter was reset after scaling. Need 3 more consecutive
+        // observations. 6 → 4
+        pool.inner.resize().await;
+        pool.inner.resize().await;
+        pool.inner.resize().await;
+        assert_eq!(metrics(&pool).pool_size.get(), 4);
+
+        // 4 → 2
+        pool.inner.resize().await;
+        pool.inner.resize().await;
+        pool.inner.resize().await;
+        assert_eq!(metrics(&pool).pool_size.get(), 2);
+
+        // 2 → 1 (min_pool_size)
+        pool.inner.resize().await;
+        pool.inner.resize().await;
+        pool.inner.resize().await;
+        assert_eq!(metrics(&pool).pool_size.get(), 1);
+
+        // Already at min — no change even after threshold.
+        pool.inner.resize().await;
+        pool.inner.resize().await;
+        pool.inner.resize().await;
+        assert_eq!(metrics(&pool).pool_size.get(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_age_refresh_caps_replacements_per_cycle() {
+        let server = MockBigTableServer::start().await.unwrap();
+        let registry = Registry::new();
+
+        let config = PoolConfig {
+            initial_pool_size: 4,
+            min_pool_size: 1,
+            max_pool_size: 10,
+            refresh_age: Duration::from_millis(0),
+            refresh_jitter: Duration::ZERO,
+            ..PoolConfig::default()
+        };
+        let pool = ChannelPool::new(server.endpoint(), config, None, Some(&registry));
+        pool.connect().await.unwrap();
+
+        // All 4 entries are expired, but only MAX_REPLACEMENTS_PER_CYCLE=2
+        // replaced per cycle.
+        pool.inner.refresh().await;
+        assert_eq!(metrics(&pool).channels_replaced.get(), 2);
+
+        // Second cycle replaces the remaining 2.
+        pool.inner.refresh().await;
+        assert_eq!(metrics(&pool).channels_replaced.get(), 4);
+    }
+}
