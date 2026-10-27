@@ -127,7 +127,7 @@ impl Backoff for BackoffPolicy {
 #[derive(Clone)]
 pub struct BigTableClient {
     /// gRPC client for interacting with Google BigTable.
-    client: BigtableInternalClient<AuthChannel>,
+    client: BigtableInternalClient<AuthChannel<Channel>>,
     /// Client name for logging and metrics.
     client_name: String,
     /// Column family name for interacting with Google BigTable.
@@ -678,9 +678,9 @@ impl BigTableClient {
 /// Used internally by `BigTableClient` to ensure all requests are properly
 /// authorized and feature-enabled when communicating with Google Bigtable.
 #[derive(Clone)]
-struct AuthChannel {
-    // The underlying gRPC channel used for communication.
-    channel: Channel,
+struct AuthChannel<S> {
+    // The underlying gRPC service used for communication.
+    channel: S,
     // The access policy (scope) for which tokens are requested.
     policy: String,
     // Provides tokens for authentication.
@@ -689,10 +689,10 @@ struct AuthChannel {
     token: Arc<RwLock<Option<Arc<Token>>>>,
 }
 
-impl AuthChannel {
+impl<S> AuthChannel<S> {
     /// Creates a new `AuthChannel` for localhost communication. It does not
     /// require authentication.
-    fn new_localhost(channel: Channel, policy: impl Into<String>) -> Self {
+    fn new_localhost(channel: S, policy: impl Into<String>) -> Self {
         Self {
             channel,
             policy: policy.into(),
@@ -704,7 +704,7 @@ impl AuthChannel {
     /// Creates a new `AuthChannel` for remote communication. It requires
     /// authentication.
     fn new_remote(
-        channel: Channel,
+        channel: S,
         policy: impl Into<String>,
         token_provider: Arc<dyn TokenProvider>,
     ) -> Self {
@@ -728,7 +728,12 @@ impl AuthChannel {
     }
 }
 
-impl Service<Request<Body>> for AuthChannel {
+impl<S> Service<Request<Body>> for AuthChannel<S>
+where
+    S: Service<Request<Body>, Response = Response<Body>> + Clone + Send + 'static,
+    S::Future: Send,
+    S::Error: Into<BigTableClientError>,
+{
     type Response = Response<Body>;
     type Error = BigTableClientError;
     type Future = Pin<Box<dyn Future<Output = Result<Self::Response>> + Send>>;
@@ -750,9 +755,9 @@ impl Service<Request<Body>> for AuthChannel {
         let auth_token = self.cached_token();
 
         Box::pin(async move {
-            // if a token provider exists, ensure a valid token is present and then
-            // if no valid token cached, fetch a new one and cache it, otherwise use the
-            // cached valid token.
+            // if a token provider exists, ensure a valid token is present and
+            // then if no valid token cached, fetch a new one and
+            // cache it, otherwise use the cached valid token.
             if let Some(ref provider) = token_provider {
                 let token = match auth_token {
                     None => {
@@ -767,12 +772,14 @@ impl Service<Request<Body>> for AuthChannel {
                 let header = HeaderValue::from_str(&format!("Bearer {}", token.as_str()))?;
                 request.headers_mut().insert("authorization", header);
             }
-            // always insert the Bigtable features header (e.g., to enable reverse scan).
+            // always insert the BigTable features header (e.g., to enable
+            // reverse scan).
             let header = HeaderValue::from_static("CAE=");
             request.headers_mut().insert("bigtable-features", header);
 
-            // forward the request to the underlying channel and return the response.
-            Ok(inner.call(request).await?)
+            // forward the request to the underlying channel and return the
+            // response.
+            inner.call(request).await.map_err(Into::into)
         })
     }
 }
