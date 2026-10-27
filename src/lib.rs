@@ -8,6 +8,8 @@ mod client;
 pub mod errors;
 /// DB operations metrics.
 pub mod metrics;
+#[cfg(test)]
+mod mock_server;
 /// Compiled protobuf definitions.
 pub mod proto;
 
