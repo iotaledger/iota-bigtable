@@ -24,6 +24,10 @@ pub enum BigTableClientError {
     InvalidHeaderValue(#[from] http::header::InvalidHeaderValue),
     #[error("io error: `{0}`")]
     Io(#[from] std::io::Error),
+    #[error("invalid pool config: {0}")]
+    InvalidPoolConfig(String),
+    #[error("establishing a BigTable channel timed out")]
+    ConnectTimeout,
 }
 
 impl BigTableClientError {
@@ -52,5 +56,11 @@ impl BigTableClientError {
         }
 
         true
+    }
+}
+
+impl From<tokio::time::error::Elapsed> for BigTableClientError {
+    fn from(_value: tokio::time::error::Elapsed) -> Self {
+        Self::ConnectTimeout
     }
 }
