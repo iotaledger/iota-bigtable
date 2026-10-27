@@ -18,5 +18,15 @@ thiserror = "2.0.12"
 tonic = { version = "0.14", features = ["tls-native-roots"] }
 tracing = "0.1.44"
 
+[features]
+# Generates the BigTable gRPC server code, needed only by the test mock server.
+test-server = []
+
+[dev-dependencies]
+# Enables the test-server feature for `cargo test` without affecting normal builds.
+iota-bigtable = { path = ".", features = ["test-server"] }
+tokio = { version = "1", features = ["macros", "net"] }
+tokio-stream = { version = "0.1", features = ["net"] }
+
 [build-dependencies]
 tonic-prost-build = { version = "0.14" }
