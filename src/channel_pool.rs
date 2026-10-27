@@ -145,7 +145,7 @@ impl PoolConfig {
         Ok(self)
     }
 
-    /// Sets the smallest size the pool ever shrinks to. Default 1.
+    /// Sets the smallest size the pool ever shrinks to. Default 10.
     pub fn min_pool_size(mut self, value: impl TryInto<NonZeroUsize>) -> Result<Self> {
         self.min_pool_size = non_zero(value, "min_pool_size")?;
         Ok(self)
@@ -260,7 +260,7 @@ impl Default for PoolConfig {
     fn default() -> Self {
         Self {
             initial_pool_size: 10,
-            min_pool_size: 1,
+            min_pool_size: 10,
             max_pool_size: 200,
             min_rpcs_per_channel: 5,
             max_rpcs_per_channel: 50,
