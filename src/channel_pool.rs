@@ -364,8 +364,12 @@ impl ChannelPool {
                 let Some(inner) = weak.upgrade() else {
                     return;
                 };
-                inner.refresh().await;
+                // Resize the pool before refresh. A replaced channel leaves the
+                // list while its RPCs are still running, so
+                // sampling the load after the replacement would
+                // undercount it.
                 inner.resize().await;
+                inner.refresh().await;
             }
         });
     }
