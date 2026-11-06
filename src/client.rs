@@ -127,7 +127,7 @@ impl Backoff for BackoffPolicy {
 #[derive(Clone)]
 pub struct BigTableClient {
     /// gRPC client for interacting with Google BigTable.
-    client: BigtableInternalClient<AuthChannel<Channel>>,
+    client: BigtableInternalClient<AuthService<Channel>>,
     /// Client name for logging and metrics.
     client_name: String,
     /// Column family name for interacting with Google BigTable.
@@ -153,14 +153,14 @@ impl BigTableClient {
         column_family: impl Into<String>,
     ) -> Result<Self> {
         let channel = Channel::from_shared(format!("http://{}", host.as_ref()))?.connect_lazy();
-        let auth_channel = AuthChannel::new_localhost(channel, BIGTABLE_POLICY);
+        let auth_service = AuthService::new_localhost(channel, BIGTABLE_POLICY);
 
         Ok(Self {
             table_prefix: format!(
                 "projects/emulator/instances/{}/tables/",
                 instance_id.as_ref()
             ),
-            client: BigtableInternalClient::new(auth_channel),
+            client: BigtableInternalClient::new(auth_service),
             client_name: client_name.into(),
             column_family: column_family.into(),
             metrics: None,
@@ -231,10 +231,10 @@ impl BigTableClient {
             token_provider.project_id().await?,
             instance_id.as_ref()
         );
-        let auth_channel = AuthChannel::new_remote(channel_pool, policy, token_provider);
+        let auth_service = AuthService::new_remote(channel_pool, policy, token_provider);
         Ok(Self {
             table_prefix,
-            client: BigtableInternalClient::new(auth_channel),
+            client: BigtableInternalClient::new(auth_service),
             client_name: client_name.into(),
             column_family: column_family.into(),
             metrics: registry.map(Metrics::new),
@@ -654,8 +654,8 @@ impl BigTableClient {
     }
 }
 
-/// A smart, thread-safe wrapper around a gRPC channel that transparently
-/// manages authentication and header injection for requests to Google Bigtable.
+/// Tower middleware that adds authentication and Bigtable feature headers to
+/// each request before forwarding it to the inner service `S`.
 ///
 /// # Purpose
 /// - Handles authentication using tokens, automatically injecting a valid
@@ -678,9 +678,9 @@ impl BigTableClient {
 /// Used internally by `BigTableClient` to ensure all requests are properly
 /// authorized and feature-enabled when communicating with Google Bigtable.
 #[derive(Clone)]
-struct AuthChannel<S> {
-    // The underlying gRPC service used for communication.
-    channel: S,
+struct AuthService<S> {
+    // The inner service requests are forwarded to.
+    inner: S,
     // The access policy (scope) for which tokens are requested.
     policy: String,
     // Provides tokens for authentication.
@@ -689,27 +689,27 @@ struct AuthChannel<S> {
     token: Arc<RwLock<Option<Arc<Token>>>>,
 }
 
-impl<S> AuthChannel<S> {
-    /// Creates a new `AuthChannel` for localhost communication. It does not
+impl<S> AuthService<S> {
+    /// Creates a new `AuthService` for localhost communication. It does not
     /// require authentication.
-    fn new_localhost(channel: S, policy: impl Into<String>) -> Self {
+    fn new_localhost(inner: S, policy: impl Into<String>) -> Self {
         Self {
-            channel,
+            inner,
             policy: policy.into(),
             token_provider: None,
             token: Arc::new(RwLock::new(None)),
         }
     }
 
-    /// Creates a new `AuthChannel` for remote communication. It requires
+    /// Creates a new `AuthService` for remote communication. It requires
     /// authentication.
     fn new_remote(
-        channel: S,
+        inner: S,
         policy: impl Into<String>,
         token_provider: Arc<dyn TokenProvider>,
     ) -> Self {
         Self {
-            channel,
+            inner,
             policy: policy.into(),
             token_provider: Some(token_provider),
             token: Arc::new(RwLock::new(None)),
@@ -728,7 +728,7 @@ impl<S> AuthChannel<S> {
     }
 }
 
-impl<S> Service<Request<Body>> for AuthChannel<S>
+impl<S> Service<Request<Body>> for AuthService<S>
 where
     S: Service<Request<Body>, Response = Response<Body>> + Clone + Send + 'static,
     S::Future: Send,
@@ -740,15 +740,15 @@ where
 
     // Checks if the underlying channel is ready to send a request.
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<()>> {
-        self.channel.poll_ready(cx).map_err(Into::into)
+        self.inner.poll_ready(cx).map_err(Into::into)
     }
     // Handles an outgoing request:
     // - Injects authentication and feature headers.
     // - Forwards the request to the underlying channel.
     fn call(&mut self, mut request: Request<Body>) -> Self::Future {
-        let cloned_channel = self.channel.clone();
+        let cloned_inner = self.inner.clone();
         let cloned_token = self.token.clone();
-        let mut inner = std::mem::replace(&mut self.channel, cloned_channel);
+        let mut inner = std::mem::replace(&mut self.inner, cloned_inner);
         let policy = self.policy.clone();
         let token_provider = self.token_provider.clone();
 
