@@ -39,7 +39,6 @@ use prometheus::{
     IntCounter, IntGauge, Registry, register_int_counter_with_registry,
     register_int_gauge_with_registry,
 };
-use rand::Rng;
 use tonic::{
     Status,
     body::Body,
@@ -72,16 +71,15 @@ pub(crate) trait ChannelPrimer: Send + Sync + 'static {
 /// Evaluated every `maintenance_interval` based on average per-channel load:
 /// - **Scale-up:** Grows the pool when load reaches or exceeds
 ///   `max_rpcs_per_channel`.
-/// - **Scale-down:** Shrinks the pool (by up to `max_resize_delta` channels) if
-///   load stays at or below `min_rpcs_per_channel` for `downscale_threshold`
-///   consecutive cycles.
+/// - **Scale-down:** Shrinks the pool (by up to `max_removed_channels`
+///   channels) if load stays at or below `min_rpcs_per_channel` for
+///   `max_maintenance_intervals` consecutive cycles.
 /// - **Bounds:** The pool size is always constrained between `min_pool_size`
 ///   and `max_pool_size`.
 ///
 /// # Refresh
-/// Channels older than `refresh_age` plus a random share of `refresh_jitter`
-/// are replaced incrementally (up to two per cycle) to prevent server-side
-/// termination after roughly one hour.
+/// Channels older than `refresh_age` are replaced incrementally (up to two per
+/// cycle) to prevent server-side termination after roughly one hour.
 ///
 /// # Example
 ///
@@ -103,9 +101,9 @@ pub struct PoolConfig {
     /// Average in-flight RPCs per channel at or above which the pool grows.
     max_rpcs_per_channel: usize,
     /// Maximum channels removed in one shrink step.
-    max_resize_delta: usize,
+    max_removed_channels: usize,
     /// Consecutive low-load cycles required before shrinking.
-    downscale_threshold: usize,
+    max_maintenance_intervals: usize,
     /// Period of the background refresh/resize loop.
     maintenance_interval: Duration,
     /// Timeout for connecting and priming a single channel.
@@ -117,8 +115,6 @@ pub struct PoolConfig {
     channel_init_timeout: Duration,
     /// Age after which a channel is replaced.
     refresh_age: Duration,
-    /// Random extra delay added to `refresh_age` per channel.
-    refresh_jitter: Duration,
 }
 
 impl PoolConfig {
@@ -157,35 +153,35 @@ impl PoolConfig {
         Ok(self)
     }
 
-    /// Average open RPCs per channel at or below which the pool is oversized.
-    /// Default 5. Zero means only a fully idle pool shrinks.
+    /// Sets the average open RPCs per channel at or below which the pool is
+    /// oversized. Default 5. Zero means only a fully idle pool shrinks.
     pub fn min_rpcs_per_channel(mut self, value: usize) -> Self {
         self.min_rpcs_per_channel = value;
         self
     }
 
-    /// Average open RPCs per channel at or above which the pool grows.
+    /// Sets the average open RPCs per channel at or above which the pool grows.
     /// Default 50. BigTable allows about 100 concurrent streams per connection.
     pub fn max_rpcs_per_channel(mut self, value: impl TryInto<NonZeroUsize>) -> Result<Self> {
         self.max_rpcs_per_channel = non_zero(value, "max_rpcs_per_channel")?;
         Ok(self)
     }
 
-    /// Maximum channels removed in one shrink step. Default 2.
-    pub fn max_resize_delta(mut self, value: impl TryInto<NonZeroUsize>) -> Result<Self> {
-        self.max_resize_delta = non_zero(value, "max_resize_delta")?;
+    /// Sets the maximum channels removed in one shrink step. Default 2.
+    pub fn max_removed_channels(mut self, value: impl TryInto<NonZeroUsize>) -> Result<Self> {
+        self.max_removed_channels = non_zero(value, "max_removed_channels")?;
         Ok(self)
     }
 
-    /// Shrinks only after this many consecutive `maintenance_interval`s with
-    /// load at or below `min_rpcs_per_channel`. Default 3.
-    pub fn downscale_threshold(mut self, value: impl TryInto<NonZeroUsize>) -> Result<Self> {
-        self.downscale_threshold = non_zero(value, "downscale_threshold")?;
+    /// Sets how many consecutive `maintenance_interval`s with load at or below
+    /// `min_rpcs_per_channel` must pass before the pool shrinks. Default 3.
+    pub fn max_maintenance_intervals(mut self, value: impl TryInto<NonZeroUsize>) -> Result<Self> {
+        self.max_maintenance_intervals = non_zero(value, "max_maintenance_intervals")?;
         Ok(self)
     }
 
-    /// How often the pool measures load and refreshes channels. Default 60s.
-    /// A zero duration is rejected.
+    /// Sets how often the pool measures load and refreshes channels. Default
+    /// 60s. A zero duration is rejected.
     pub fn maintenance_interval(mut self, value: Duration) -> Result<Self> {
         if value.is_zero() {
             return Err(BigTableClientError::InvalidPoolConfig(
@@ -221,19 +217,12 @@ impl PoolConfig {
         Ok(self)
     }
 
-    /// Age at which a channel is replaced. Default 45 minutes.
+    /// Sets the age at which a channel is replaced. Default 45 minutes.
     ///
     /// A zero duration causes constant reconnection and is only useful in
     /// tests. Keep this well above the maintenance interval in production.
     pub fn refresh_age(mut self, value: Duration) -> Self {
         self.refresh_age = value;
-        self
-    }
-
-    /// Random extra age added to `refresh_age` per channel. Default 5 minutes.
-    /// Zero disables jitter.
-    pub fn refresh_jitter(mut self, value: Duration) -> Self {
-        self.refresh_jitter = value;
         self
     }
 
@@ -264,15 +253,13 @@ impl Default for PoolConfig {
             max_pool_size: 200,
             min_rpcs_per_channel: 5,
             max_rpcs_per_channel: 50,
-            max_resize_delta: 2,
-            downscale_threshold: 3,
+            max_removed_channels: 2,
+            max_maintenance_intervals: 3,
             maintenance_interval: Duration::from_secs(60),
             channel_init_timeout: Duration::from_secs(10),
             // GFE forcibly disconnects channels after ~60 minutes for load
-            // balancing. Refresh at 45m + up to 5m jitter to replace channels
-            // before reaping.
+            // balancing. Refresh at 45m to replace channels before reaping.
             refresh_age: Duration::from_secs(45 * 60),
-            refresh_jitter: Duration::from_secs(5 * 60),
         }
     }
 }
@@ -328,7 +315,7 @@ impl ChannelPool {
     ) -> Result<Self> {
         let pool = Self::new(endpoint, config, primer, registry)?;
         pool.connect().await?;
-        pool.spawn_background_tasks();
+        pool.spawn_maintenance_task();
         Ok(pool)
     }
 
@@ -351,9 +338,9 @@ impl ChannelPool {
         Ok(())
     }
 
-    /// Spawn the background maintenance loop that periodically refreshes
+    /// Spawns the background maintenance loop that periodically refreshes
     /// aged-out channels and resizes the pool based on load.
-    fn spawn_background_tasks(&self) {
+    fn spawn_maintenance_task(&self) {
         let weak = Arc::downgrade(&self.inner);
         let period = self.inner.config.maintenance_interval;
         tokio::spawn(async move {
@@ -424,7 +411,7 @@ impl ChannelPoolInner {
         Ok(entries[idx].clone())
     }
 
-    /// Swap out connections that are too old. At most
+    /// Swaps out connections that are too old. At most
     /// `MAX_REPLACEMENTS_PER_CYCLE` per run, so we don't
     /// reconnect everything at once. Also logs and resets each connection's
     /// success and error counts.
@@ -472,10 +459,10 @@ impl ChannelPoolInner {
         }
     }
 
-    /// Scale the pool up or down based on current per-channel load. Uses a
+    /// Scales the pool up or down based on current per-channel load. Uses a
     /// point-in-time sampling approach inherited from the official Google
     /// Cloud Go client's channel pool implementation.
-    async fn resize(&self) {
+    async fn resize(self: &Arc<Self>) {
         let entries = self.entries.load();
         let current_size = entries.len();
         if current_size == 0 {
@@ -493,93 +480,102 @@ impl ChannelPoolInner {
             / 2.0;
 
         if load <= self.config.min_rpcs_per_channel as f64 {
-            // Ideal pool size to bring per-channel load back to target_load.
-            // We don't jump straight to this size — delta is capped by
-            // max_resize_delta to avoid removing too many channels at once
-            // and causing a load spike.
-            let pool_size_target = (total_in_flight as f64 / target_load.max(1.0)).ceil() as usize;
-            let pool_size_target = pool_size_target.max(self.config.min_pool_size);
-            let delta =
-                (current_size.saturating_sub(pool_size_target)).min(self.config.max_resize_delta);
-            if delta == 0 {
-                self.consecutive_low_load.store(0, Ordering::Relaxed);
-                return;
-            }
-
-            // Scale down: load is too low. Require consecutive low-load
-            // observations before actually shrinking, to avoid flapping
-            // (mirrors official Google Go client continuousDownscaleRuns
-            // logic).
-            let runs = self.consecutive_low_load.fetch_add(1, Ordering::Relaxed) + 1;
-            if runs < self.config.downscale_threshold {
-                return;
-            }
-
-            let mut new_entries = (**entries).clone();
-            let new_len = current_size
-                .saturating_sub(delta)
-                .max(self.config.min_pool_size);
-            // Drop the channels closest to their refresh deadline so refresh
-            // has less to replace later.
-            new_entries.sort_by_key(|e| std::cmp::Reverse(e.refresh_at));
-            new_entries.truncate(new_len);
-            info!(
-                current_size,
-                new_len, total_in_flight, "pool resize: shrunk"
-            );
-            self.entries.store(Arc::new(new_entries));
-            self.consecutive_low_load.store(0, Ordering::Relaxed);
-            if let Some(m) = &self.metrics {
-                m.pool_size.set(new_len as i64);
-            }
+            self.scale_down(&entries, total_in_flight, target_load);
         } else {
-            // Load is above the low threshold — reset the downscale streak.
+            // Load is above the low threshold, reset the downscale streak.
             self.consecutive_low_load.store(0, Ordering::Relaxed);
-
             if load >= self.config.max_rpcs_per_channel as f64 {
-                // Scale up: load is too high.
-                let pool_size_target = ((total_in_flight as f64 / target_load.max(1.0)).ceil()
-                    as usize)
-                    .min(self.config.max_pool_size);
-                let delta = pool_size_target.saturating_sub(current_size);
-                if delta == 0 {
-                    return;
-                }
-
-                let mut new_entries = (**entries).clone();
-                for _ in 0..delta {
-                    match self.create_primed_entry().await {
-                        Ok(entry) => new_entries.push(Arc::new(entry)),
-                        Err(e) => {
-                            warn!(error = %e, "failed to create channel during pool expansion");
-                            break;
-                        }
-                    }
-                }
-                let new_size = new_entries.len();
-                if new_size == current_size {
-                    return;
-                }
-                info!(
-                    current_size,
-                    new_size, total_in_flight, "pool resize: expanded"
-                );
-                self.entries.store(Arc::new(new_entries));
-                if let Some(m) = &self.metrics {
-                    m.pool_size.set(new_size as i64);
-                }
+                self.scale_up(&entries, total_in_flight, target_load).await;
             }
         }
     }
 
-    /// Computes the deadline at which a channel should be replaced.
-    fn compute_refresh_at(refresh_age: Duration, refresh_jitter: Duration) -> Instant {
-        let jitter = if refresh_jitter.is_zero() {
-            Duration::ZERO
-        } else {
-            Duration::from_nanos(rand::thread_rng().gen_range(0..refresh_jitter.as_nanos() as u64))
-        };
-        Instant::now() + refresh_age + jitter
+    /// Removes up to `max_removed_channels` channels once load has stayed low
+    /// for `max_maintenance_intervals` cycles.
+    fn scale_down(&self, entries: &[Arc<PoolEntry>], total_in_flight: usize, target_load: f64) {
+        let current_size = entries.len();
+        // Ideal pool size to bring per-channel load back to target_load.
+        // We don't jump straight to this size — delta is capped by
+        // max_removed_channels to avoid removing too many channels at once
+        // and causing a load spike.
+        let pool_size_target = (total_in_flight as f64 / target_load.max(1.0)).ceil() as usize;
+        let pool_size_target = pool_size_target.max(self.config.min_pool_size);
+        let delta =
+            (current_size.saturating_sub(pool_size_target)).min(self.config.max_removed_channels);
+        if delta == 0 {
+            self.consecutive_low_load.store(0, Ordering::Relaxed);
+            return;
+        }
+
+        // Scale down: load is too low. Require consecutive low-load
+        // observations before actually shrinking, to avoid flapping
+        // (mirrors official Google Go client continuousDownscaleRuns
+        // logic).
+        let runs = self.consecutive_low_load.fetch_add(1, Ordering::Relaxed) + 1;
+        if runs < self.config.max_maintenance_intervals {
+            return;
+        }
+
+        let mut new_entries = entries.to_vec();
+        let new_len = current_size
+            .saturating_sub(delta)
+            .max(self.config.min_pool_size);
+        // Drop the channels closest to their refresh deadline so refresh
+        // has less to replace later.
+        new_entries.sort_by_key(|e| std::cmp::Reverse(e.refresh_at));
+        new_entries.truncate(new_len);
+        info!(
+            current_size,
+            new_len, total_in_flight, "pool resize: shrunk"
+        );
+        self.entries.store(Arc::new(new_entries));
+        self.consecutive_low_load.store(0, Ordering::Relaxed);
+        if let Some(m) = &self.metrics {
+            m.pool_size.set(new_len as i64);
+        }
+    }
+
+    /// Opens channels to bring per-channel load back to `target_load`, up to
+    /// `max_pool_size`.
+    async fn scale_up(
+        self: &Arc<Self>,
+        entries: &[Arc<PoolEntry>],
+        total_in_flight: usize,
+        target_load: f64,
+    ) {
+        let current_size = entries.len();
+        let pool_size_target = ((total_in_flight as f64 / target_load.max(1.0)).ceil() as usize)
+            .min(self.config.max_pool_size);
+        let delta = pool_size_target.saturating_sub(current_size);
+        if delta == 0 {
+            return;
+        }
+
+        let mut tasks = tokio::task::JoinSet::new();
+        for _ in 0..delta {
+            let inner = Arc::clone(self);
+            tasks.spawn(async move { inner.create_primed_entry().await });
+        }
+        let mut new_entries = entries.to_vec();
+        while let Some(result) = tasks.join_next().await {
+            match result {
+                Ok(Ok(entry)) => new_entries.push(Arc::new(entry)),
+                Ok(Err(e)) => warn!(error = %e, "failed to create channel during pool expansion"),
+                Err(e) => warn!(error = %e, "channel creation task failed"),
+            }
+        }
+        let new_size = new_entries.len();
+        if new_size == current_size {
+            return;
+        }
+        info!(
+            current_size,
+            new_size, total_in_flight, "pool resize: expanded"
+        );
+        self.entries.store(Arc::new(new_entries));
+        if let Some(m) = &self.metrics {
+            m.pool_size.set(new_size as i64);
+        }
     }
 
     /// Opens, primes and wraps a new channel. This is the single place every
@@ -608,10 +604,7 @@ impl ChannelPoolInner {
         }
         Ok(PoolEntry {
             channel,
-            refresh_at: Self::compute_refresh_at(
-                self.config.refresh_age,
-                self.config.refresh_jitter,
-            ),
+            refresh_at: Instant::now() + self.config.refresh_age,
             in_flight: AtomicUsize::new(0),
             success_count: AtomicUsize::new(0),
             error_count: AtomicUsize::new(0),

@@ -663,7 +663,6 @@ dependencies = [
  "prometheus",
  "prost",
  "prost-types",
- "rand",
  "serde",
  "thiserror 2.0.12",
  "tokio",
