@@ -927,8 +927,8 @@ mod tests {
 
     #[rstest]
     #[case::initial_pool_size(PoolConfig::default().initial_pool_size(0), "initial_pool_size")]
-    #[case::max_resize_delta(PoolConfig::default().max_resize_delta(0), "max_resize_delta")]
-    #[case::downscale_threshold(PoolConfig::default().downscale_threshold(0), "downscale_threshold")]
+    #[case::max_removed_channels(PoolConfig::default().max_removed_channels(0), "max_removed_channels")]
+    #[case::max_maintenance_intervals(PoolConfig::default().max_maintenance_intervals(0), "max_maintenance_intervals")]
     #[case::maintenance_interval(PoolConfig::default().maintenance_interval(Duration::ZERO), "maintenance_interval")]
     #[case::channel_init_timeout(PoolConfig::default().channel_init_timeout(Duration::ZERO), "channel_init_timeout")]
     fn test_config_rejects_zero(#[case] result: Result<PoolConfig>, #[case] field: &str) {
@@ -967,18 +967,6 @@ mod tests {
     #[case::min_rpcs_not_below_max(valid_config().min_rpcs_per_channel(50), RPCS_MSG)]
     fn test_config_validate_rejects(#[case] config: PoolConfig, #[case] msg: &str) {
         assert_eq!(config.validate().unwrap_err().to_string(), msg);
-    }
-
-    #[rstest]
-    #[case::zero(Duration::ZERO)]
-    #[case::sub_millisecond(Duration::from_micros(500))]
-    #[case::five_minutes(Duration::from_secs(300))]
-    fn test_compute_refresh_at_bounds_jitter(#[case] jitter: Duration) {
-        let age = Duration::from_secs(45 * 60);
-        let before = Instant::now();
-        let at = ChannelPoolInner::compute_refresh_at(age, jitter);
-        assert!(at >= before + age);
-        assert!(at <= Instant::now() + age + jitter);
     }
 
     #[tokio::test]
@@ -1115,7 +1103,7 @@ mod tests {
             initial_pool_size: 1,
             min_pool_size: 1,
             max_pool_size: 10,
-            max_resize_delta: 2,
+            max_removed_channels: 2,
             ..PoolConfig::default()
         };
         let pool = ChannelPool::new(server.endpoint(), config, None, Some(&registry)).unwrap();
@@ -1143,9 +1131,9 @@ mod tests {
         pool.inner.resize().await;
         assert_eq!(metrics(&pool).pool_size.get(), 8);
 
-        // Remove load. Scale down requires downscale_threshold (default 3)
-        // consecutive low-load observations before actually shrinking, then
-        // is capped by max_resize_delta=2.
+        // Remove load. Scale down requires max_maintenance_intervals (default
+        // 3) consecutive low-load observations before actually
+        // shrinking, then is capped by max_removed_channels=2.
         set_total_in_flight(0);
 
         // First two low-load observations: no shrink yet (threshold not met).
@@ -1196,13 +1184,12 @@ mod tests {
             min_pool_size: 1,
             max_pool_size: 10,
             refresh_age: Duration::from_millis(0),
-            refresh_jitter: Duration::ZERO,
             ..PoolConfig::default()
         };
         let pool = ChannelPool::new(server.endpoint(), config, None, Some(&registry)).unwrap();
         pool.connect().await.unwrap();
 
-        // All 4 entries are expired, but only MAX_REPLACEMENTS_PER_CYCLE=2
+        // All 4 entries are expired, but only MIN_REPLACEMENTS_PER_CYCLE=2
         // replaced per cycle.
         pool.inner.refresh().await;
         assert_eq!(metrics(&pool).channels_replaced.get(), 2);
