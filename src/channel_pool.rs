@@ -380,7 +380,13 @@ impl Drop for InFlightGuard {
 struct ReservedChannel {
     /// Counts this RPC in the entry's `in_flight` until the response body ends.
     guard: InFlightGuard,
-    /// The channel used in `poll_ready` must be the same one used in `call`.
+    /// A clone of the inner guard channel.
+    ///
+    /// This must be the exact instance advanced by `poll_ready` and passed to
+    /// `call`. Because a tonic `Channel` wraps a tower `Buffer`,
+    /// `poll_ready` transitions it from `Idle` to `ReadyToSend` by
+    /// reserving a queue slot. A fresh clone would stay `Idle` and panic in
+    /// `call`.
     channel: Channel,
 }
 
