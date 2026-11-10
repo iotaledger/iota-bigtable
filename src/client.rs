@@ -156,8 +156,7 @@ impl BigTableClient {
         column_family: impl Into<String>,
     ) -> Result<Self> {
         let endpoint = Channel::from_shared(format!("http://{}", host.as_ref()))?;
-        let pool =
-            ChannelPool::new_connected(endpoint, PoolConfig::singleton(), None, None).await?;
+        let pool = ChannelPool::start(endpoint, PoolConfig::singleton(), None, None).await?;
         let auth_service = AuthService::new_localhost(pool, BIGTABLE_POLICY);
 
         Ok(Self {
@@ -257,8 +256,7 @@ impl BigTableClient {
         };
         let registry = registry.into();
         let pool =
-            ChannelPool::new_connected(endpoint, pool_config, Some(Box::new(primer)), registry)
-                .await?;
+            ChannelPool::start(endpoint, pool_config, Some(Box::new(primer)), registry).await?;
         let auth_service = AuthService::new_remote(pool, policy, token_provider);
         Ok(Self {
             table_prefix,
