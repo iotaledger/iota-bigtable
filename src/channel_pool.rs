@@ -1194,7 +1194,7 @@ mod tests {
         pool.inner.refresh().await;
         assert_eq!(metrics(&pool).channels_replaced.get(), 2);
 
-        // Second cycle replaces the remaining 2.
+        // Second cycle replaces another two.
         pool.inner.refresh().await;
         assert_eq!(metrics(&pool).channels_replaced.get(), 4);
     }
