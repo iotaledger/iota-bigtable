@@ -49,8 +49,11 @@ use tracing::{debug, info, warn};
 
 use crate::errors::{BigTableClientError, Result};
 
-/// Maximum number of expired connections to be replaced at once.
-const MAX_REPLACEMENTS_PER_CYCLE: usize = 2;
+/// Fraction of the pool that may be replaced in one maintenance cycle, as a
+/// divisor.
+const MAX_REPLACEMENTS_PER_CYCLE_DIVISOR: usize = 5;
+/// Minimum connection replacements per maintenance cycle.
+const MIN_REPLACEMENTS_PER_CYCLE: usize = 2;
 
 /// Runs a first RPC on a freshly connected channel before it enters the
 /// pool, so the first real request does not pay the connection setup cost.
@@ -85,7 +88,10 @@ pub(crate) trait ChannelPrimer: Send + Sync + 'static {
 ///
 /// ```rust
 /// # use iota_bigtable::PoolConfig;
-/// let config = PoolConfig::new().initial_pool_size(4)?.max_pool_size(10)?;
+/// let config = PoolConfig::new()
+///     .min_pool_size(2)?
+///     .initial_pool_size(4)?
+///     .max_pool_size(10)?;
 /// # Ok::<(), iota_bigtable::errors::BigTableClientError>(())
 /// ```
 #[derive(Debug, Clone)]
@@ -284,7 +290,9 @@ pub(crate) struct ChannelPool {
 }
 
 impl ChannelPool {
-    /// Creates a pool without connecting or spawning background tasks.
+    /// Creates an empty connection pool with no active connections yet.
+    ///
+    /// Useful for tests that call `refresh` and `resize` manually.
     pub(crate) fn new(
         endpoint: Endpoint,
         config: PoolConfig,
@@ -306,8 +314,11 @@ impl ChannelPool {
         })
     }
 
-    /// Creates a pool, connects it, and spawns background maintenance tasks.
-    pub(crate) async fn new_connected(
+    /// Starts the connection pool with its connections ready for use.
+    ///
+    /// Opens and primes `initial_pool_size` channels, then starts the
+    /// maintenance task responsible for refreshing and resizing them.
+    pub(crate) async fn start(
         endpoint: Endpoint,
         config: PoolConfig,
         primer: Option<Box<dyn ChannelPrimer>>,
@@ -411,15 +422,15 @@ impl ChannelPoolInner {
         Ok(entries[idx].clone())
     }
 
-    /// Swaps out connections that are too old. At most
-    /// `MAX_REPLACEMENTS_PER_CYCLE` per run, so we don't
-    /// reconnect everything at once. Also logs and resets each connection's
-    /// success and error counts.
-    async fn refresh(&self) {
+    /// Swaps out connections that are too old, at most a fifth of the pool
+    /// per run so we don't reconnect everything at once. Also logs and resets
+    /// each connection's success and error counts.
+    async fn refresh(self: &Arc<Self>) {
         let snapshot = self.entries.load();
-        let mut new_vec: Vec<Arc<PoolEntry>> = (**snapshot).clone();
         let now = Instant::now();
-        let mut replacements = 0;
+        let max_replacements =
+            (snapshot.len() / MAX_REPLACEMENTS_PER_CYCLE_DIVISOR).max(MIN_REPLACEMENTS_PER_CYCLE);
+        let mut tasks = tokio::task::JoinSet::new();
 
         for (idx, entry) in snapshot.iter().enumerate() {
             let successes = entry.success_count.swap(0, Ordering::Relaxed);
@@ -431,23 +442,26 @@ impl ChannelPoolInner {
                 );
             }
 
-            if replacements >= MAX_REPLACEMENTS_PER_CYCLE {
+            if tasks.len() >= max_replacements || now < entry.refresh_at {
                 continue;
             }
+            let inner = Arc::clone(self);
+            tasks.spawn(async move { (idx, inner.create_primed_entry().await) });
+        }
 
-            if now < entry.refresh_at {
-                continue;
-            }
-
-            match self.create_primed_entry().await {
-                Ok(new_entry) => {
+        let mut new_vec: Vec<Arc<PoolEntry>> = (**snapshot).clone();
+        let mut replacements = 0;
+        while let Some(joined) = tasks.join_next().await {
+            match joined {
+                Ok((idx, Ok(new_entry))) => {
                     info!(channel_idx = idx, "replacing bigtable channel");
                     new_vec[idx] = Arc::new(new_entry);
                     replacements += 1;
                 }
-                Err(e) => {
-                    warn!(channel_idx = idx, error = %e, "failed to create replacement channel");
+                Ok((idx, Err(e))) => {
+                    warn!(channel_idx = idx, error = %e, "failed to create replacement channel")
                 }
+                Err(e) => warn!(error = %e, "replacement task failed"),
             }
         }
 
