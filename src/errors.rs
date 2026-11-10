@@ -26,8 +26,8 @@ pub enum BigTableClientError {
     Io(#[from] std::io::Error),
     #[error("invalid pool config: {0}")]
     InvalidPoolConfig(String),
-    #[error("establishing a BigTable channel timed out")]
-    ConnectTimeout,
+    #[error("initializing a BigTable channel timed out")]
+    ChannelInitTimeout,
 }
 
 impl BigTableClientError {
@@ -56,11 +56,5 @@ impl BigTableClientError {
         }
 
         true
-    }
-}
-
-impl From<tokio::time::error::Elapsed> for BigTableClientError {
-    fn from(_value: tokio::time::error::Elapsed) -> Self {
-        Self::ConnectTimeout
     }
 }

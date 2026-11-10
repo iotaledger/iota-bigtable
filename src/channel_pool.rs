@@ -42,8 +42,13 @@ use tracing::{debug, info};
 
 use crate::errors::{BigTableClientError, Result};
 
-/// Warms a freshly connected channel before it enters the pool.
+/// Runs a first RPC on a freshly connected channel before it enters the
+/// pool, so the first real request does not pay the connection setup cost.
+///
+/// The name follows the official Go client, whose `ChannelPrimer` issues a
+/// `PingAndWarm` for the same purpose.
 pub(crate) trait ChannelPrimer: Send + Sync + 'static {
+    /// Primes `channel`. Errors and timeouts discard the channel.
     fn prime<'a>(
         &'a self,
         channel: &'a Channel,
@@ -82,7 +87,7 @@ impl PoolConfig {
         Self::default()
     }
 
-    /// Represents a single-channel pool with no scaling, for testing or local
+    /// Creates a single-channel config with no scaling, for testing or local
     /// use.
     pub fn singleton() -> Self {
         Self {
@@ -93,25 +98,25 @@ impl PoolConfig {
         }
     }
 
-    /// Channels opened on connect. Default 10.
+    /// Sets the number of channels opened on connect. Default 10.
     pub fn initial_pool_size(mut self, value: impl TryInto<NonZeroUsize>) -> Result<Self> {
         self.initial_pool_size = non_zero(value, "initial_pool_size")?;
         Ok(self)
     }
 
-    /// Smallest the pool ever shrinks to. Default 1.
+    /// Sets the smallest size the pool ever shrinks to. Default 1.
     pub fn min_pool_size(mut self, value: impl TryInto<NonZeroUsize>) -> Result<Self> {
         self.min_pool_size = non_zero(value, "min_pool_size")?;
         Ok(self)
     }
 
-    /// Largest the pool ever grows to. Default 200.
+    /// Sets the largest size the pool ever grows to. Default 200.
     pub fn max_pool_size(mut self, value: impl TryInto<NonZeroUsize>) -> Result<Self> {
         self.max_pool_size = non_zero(value, "max_pool_size")?;
         Ok(self)
     }
 
-    /// Timeout for opening and priming a single channel. Default 10s.
+    /// Sets the timeout for opening and priming a single channel. Default 10s.
     ///
     /// Covers TCP connect, TLS, and HTTP/2 handshakes.
     ///
@@ -168,21 +173,19 @@ fn non_zero(value: impl TryInto<NonZeroUsize>, field: &str) -> Result<usize> {
 /// streams) from creating queueing bottlenecks.
 pub(crate) struct ChannelPool {
     inner: Arc<ChannelPoolInner>,
-    // Stores the entry and a *clone* of its channel after poll_ready. We need
-    // the clone because Channel::poll_ready takes &mut self, and
-    // entry.channel isn't mutable through Arc.
-    reserved: Option<(Arc<PoolEntry>, Channel)>,
+    reserved: Option<ReservedChannel>,
 }
 
 impl ChannelPool {
-    /// Create a pool without connecting.
+    /// Creates a pool without connecting.
     pub(crate) fn new(
         endpoint: Endpoint,
         config: PoolConfig,
         primer: Option<Box<dyn ChannelPrimer>>,
         registry: Option<&Registry>,
-    ) -> Self {
-        Self {
+    ) -> Result<Self> {
+        config.validate()?;
+        Ok(Self {
             inner: Arc::new(ChannelPoolInner {
                 entries: ArcSwap::from_pointee(Vec::new()),
                 ticker: AtomicUsize::new(0),
@@ -192,23 +195,22 @@ impl ChannelPool {
                 metrics: registry.map(|r| Arc::new(Metrics::new(r))),
             }),
             reserved: None,
-        }
+        })
     }
 
-    /// Create and connect.
+    /// Creates a pool and connects it.
     pub(crate) async fn new_connected(
         endpoint: Endpoint,
         config: PoolConfig,
         primer: Option<Box<dyn ChannelPrimer>>,
         registry: Option<&Registry>,
     ) -> Result<Self> {
-        config.validate()?;
-        let pool = Self::new(endpoint, config, primer, registry);
+        let pool = Self::new(endpoint, config, primer, registry)?;
         pool.connect().await?;
         Ok(pool)
     }
 
-    /// Connect `initial_pool_size` channels, priming each one.
+    /// Connects `initial_pool_size` channels, priming each one.
     pub(crate) async fn connect(&self) -> Result<()> {
         let start = Instant::now();
         let mut entries = Vec::with_capacity(self.inner.config.initial_pool_size);
@@ -237,14 +239,6 @@ impl Clone for ChannelPool {
     }
 }
 
-impl Drop for ChannelPool {
-    fn drop(&mut self) {
-        if let Some((entry, _)) = self.reserved.take() {
-            entry.in_flight.fetch_sub(1, Ordering::Relaxed);
-        }
-    }
-}
-
 /// Shared inner state for [`ChannelPool`]:
 ///
 /// - **Creation:** Channels are opened and primed via `create_primed_entry`.
@@ -264,6 +258,18 @@ pub(crate) struct ChannelPoolInner {
 }
 
 impl ChannelPoolInner {
+    /// Selects the entry for the next RPC in round-robin order. Fails when the
+    /// pool holds no channels.
+    fn select_next(&self) -> Result<Arc<PoolEntry>> {
+        let entries = self.entries.load();
+        if entries.is_empty() {
+            // Unavailable is transient, so the client's backoff retries it.
+            return Err(Status::unavailable("no channels available").into());
+        }
+        let idx = self.ticker.fetch_add(1, Ordering::Relaxed) % entries.len();
+        Ok(entries[idx].clone())
+    }
+
     /// Opens, primes and wraps a new channel. This is the single place every
     /// pool entry is created.
     ///
@@ -277,11 +283,15 @@ impl ChannelPoolInner {
     async fn create_primed_entry(&self) -> Result<PoolEntry> {
         let timeout = self.config.channel_init_timeout;
         let start = Instant::now();
-        let channel = tokio::time::timeout(timeout, self.endpoint.connect()).await??;
+        let channel = tokio::time::timeout(timeout, self.endpoint.connect())
+            .await
+            .map_err(|_| BigTableClientError::ChannelInitTimeout)??;
         debug!(elapsed = ?start.elapsed(), "bigtable channel connected");
         if let Some(primer) = self.primer.as_deref() {
             let start = Instant::now();
-            tokio::time::timeout(timeout, primer.prime(&channel)).await??;
+            tokio::time::timeout(timeout, primer.prime(&channel))
+                .await
+                .map_err(|_| BigTableClientError::ChannelInitTimeout)??;
             debug!(elapsed = ?start.elapsed(), "bigtable channel primed");
         }
         Ok(PoolEntry {
@@ -346,9 +356,40 @@ struct InFlightGuard {
     entry: Arc<PoolEntry>,
 }
 
+impl InFlightGuard {
+    fn new(entry: Arc<PoolEntry>) -> Self {
+        entry.in_flight.fetch_add(1, Ordering::Relaxed);
+        Self { entry }
+    }
+}
+
 impl Drop for InFlightGuard {
     fn drop(&mut self) {
         self.entry.in_flight.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// A [`PoolEntry`] channel reserved for one RPC by
+/// [`ChannelPool::poll_ready`] and held until [`ChannelPool::call`] uses it.
+///
+/// Each entry holds a single HTTP/2 connection shared by many concurrent
+/// RPCs, so the pool cannot hand out exclusive channels. Instead `poll_ready`
+/// picks an entry, counts the RPC in its `in_flight`, and keeps the channel it
+/// checked until `call` sends on it. The guard releases the count when the
+/// response body ends or the reservation is dropped.
+struct ReservedChannel {
+    /// Counts this RPC in the entry's `in_flight` until the response body ends.
+    guard: InFlightGuard,
+    /// The channel used in `poll_ready` must be the same one used in `call`.
+    channel: Channel,
+}
+
+impl ReservedChannel {
+    fn new(entry: Arc<PoolEntry>) -> Self {
+        Self {
+            channel: entry.channel.clone(),
+            guard: InFlightGuard::new(entry),
+        }
     }
 }
 
@@ -364,6 +405,18 @@ struct GuardedBody {
     /// Released when the inner body ends, or when the body is dropped,
     /// whichever comes first.
     guard: Option<InFlightGuard>,
+    /// Counts the RPC as completed when the body ends.
+    metrics: Option<Arc<Metrics>>,
+}
+
+impl GuardedBody {
+    fn new(inner: Body, guard: InFlightGuard, metrics: impl Into<Option<Arc<Metrics>>>) -> Self {
+        Self {
+            inner,
+            guard: Some(guard),
+            metrics: metrics.into(),
+        }
+    }
 }
 
 // Forwards every call to the wrapped body and releases the guard on the
@@ -385,6 +438,9 @@ impl http_body::Body for GuardedBody {
         };
         if ended {
             self.guard.take();
+            if let Some(m) = &self.metrics {
+                m.rpcs_completed.inc();
+            }
         }
         Poll::Ready(frame)
     }
@@ -415,13 +471,16 @@ impl Service<Request<Body>> for ChannelPool {
     type Future = Pin<Box<dyn Future<Output = Result<Self::Response>> + Send>>;
 
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<()>> {
-        if let Some((entry, channel)) = &mut self.reserved {
-            return match channel.poll_ready(cx) {
+        if let Some(reservation) = &mut self.reserved {
+            return match reservation.channel.poll_ready(cx) {
                 Poll::Ready(Err(e)) => {
                     // Same bookkeeping as a failed first selection, and clear
                     // the reservation so the next RPC picks a fresh channel.
-                    entry.in_flight.fetch_sub(1, Ordering::Relaxed);
-                    entry.error_count.fetch_add(1, Ordering::Relaxed);
+                    reservation
+                        .guard
+                        .entry
+                        .error_count
+                        .fetch_add(1, Ordering::Relaxed);
                     self.reserved = None;
                     Poll::Ready(Err(e.into()))
                 }
@@ -429,26 +488,21 @@ impl Service<Request<Body>> for ChannelPool {
             };
         }
 
-        let entries = self.inner.entries.load();
-        if entries.is_empty() {
-            // Unavailable is transient, so the client's backoff retries it.
-            return Poll::Ready(Err(Status::unavailable("no channels available").into()));
-        }
-        let idx = self.inner.ticker.fetch_add(1, Ordering::Relaxed) % entries.len();
-        let entry = &entries[idx];
-        let mut channel = entry.channel.clone();
-        entry.in_flight.fetch_add(1, Ordering::Relaxed);
-        match channel.poll_ready(cx) {
+        let entry = match self.inner.select_next() {
+            Ok(entry) => entry,
+            Err(e) => return Poll::Ready(Err(e)),
+        };
+        let mut reservation = ReservedChannel::new(entry.clone());
+        match reservation.channel.poll_ready(cx) {
             Poll::Ready(Ok(())) => {
-                self.reserved = Some((entry.clone(), channel));
+                self.reserved = Some(reservation);
                 Poll::Ready(Ok(()))
             }
             Poll::Pending => {
-                self.reserved = Some((entry.clone(), channel));
+                self.reserved = Some(reservation);
                 Poll::Pending
             }
             Poll::Ready(Err(e)) => {
-                entry.in_flight.fetch_sub(1, Ordering::Relaxed);
                 entry.error_count.fetch_add(1, Ordering::Relaxed);
                 Poll::Ready(Err(e.into()))
             }
@@ -456,34 +510,23 @@ impl Service<Request<Body>> for ChannelPool {
     }
 
     fn call(&mut self, request: Request<Body>) -> Self::Future {
-        let (entry, mut channel) = self
+        let ReservedChannel { guard, mut channel } = self
             .reserved
             .take()
             .expect("poll_ready must be called before call");
         let metrics = self.inner.metrics.clone();
 
         Box::pin(async move {
-            let guard = InFlightGuard {
-                entry: entry.clone(),
-            };
             match channel.call(request).await {
                 Ok(response) => {
-                    entry.success_count.fetch_add(1, Ordering::Relaxed);
-                    if let Some(m) = &metrics {
-                        m.rpcs_completed.inc();
-                    }
+                    guard.entry.success_count.fetch_add(1, Ordering::Relaxed);
                     // Move the guard into the body so `in_flight` stays
                     // accurate for the lifetime of the HTTP/2 stream, not
                     // just until the headers arrive.
-                    Ok(response.map(|inner| {
-                        Body::new(GuardedBody {
-                            inner,
-                            guard: Some(guard),
-                        })
-                    }))
+                    Ok(response.map(|inner| Body::new(GuardedBody::new(inner, guard, metrics))))
                 }
                 Err(e) => {
-                    entry.error_count.fetch_add(1, Ordering::Relaxed);
+                    guard.entry.error_count.fetch_add(1, Ordering::Relaxed);
                     Err(e.into())
                 }
             }
