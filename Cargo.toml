@@ -19,7 +19,7 @@ tonic-prost = "0.14"
 serde = { version = "1.0.144", features = ["derive"] }
 thiserror = "2.0.12"
 tonic = { version = "0.14", features = ["tls-native-roots"] }
-tokio = { version = "1", features = ["time"] }
+tokio = { version = "1", features = ["rt", "time"] }
 tracing = "0.1.44"
 
 [features]
