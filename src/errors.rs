@@ -45,7 +45,8 @@ impl BigTableClientError {
             );
         }
 
-        // we don't have access to the error kind, so we use the error message instead.
+        // we don't have access to the error kind, so we use the error message
+        // instead.
         if let BigTableClientError::GrpcTransport(e) = &self {
             return !e.to_string().contains("transport error");
         }
