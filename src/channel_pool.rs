@@ -16,9 +16,6 @@
 //!   minutes to prevent failures caused by BigTable's server-side connection
 //!   termination policy (roughly 1 hour).
 
-// TODO: The pool is not used by the client yet. Remove once done.
-#![allow(dead_code)]
-
 use std::{
     future::Future,
     num::NonZeroUsize,
